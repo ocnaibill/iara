@@ -179,8 +179,31 @@ impl Mixer {
         self.run(EditCommand::RenameChannel { channel, name })
     }
 
-    fn remove_channel(&self, channel: String) -> fdo::Result<u64> {
-        self.run(EditCommand::RemoveChannel { channel })
+    /// `destination` é o canal que herda as regras do removido; vazio = Não atribuídos (as regras são apagadas).
+    fn remove_channel(&self, channel: String, destination: String) -> fdo::Result<u64> {
+        self.run(EditCommand::RemoveChannel {
+            channel,
+            destination: opt(destination),
+        })
+    }
+
+    /// Associa um aplicativo a um canal salvando a regra no perfil. Os campos de identidade vazios são ignorados (ao menos
+    /// um é obrigatório); `channel` vazio apaga a regra (o aplicativo volta a Não atribuídos).
+    fn assign_app(
+        &self,
+        app_id: String,
+        binary: String,
+        name: String,
+        channel: String,
+    ) -> fdo::Result<u64> {
+        self.run(EditCommand::AssignApp {
+            matcher: iara_core::apps::AppMatcher {
+                app_id: opt(app_id),
+                binary: opt(binary),
+                name: opt(name),
+            },
+            channel: opt(channel),
+        })
     }
 
     /// O retrato mudou (perfil ou status); releia com `GetState`.

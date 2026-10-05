@@ -149,9 +149,36 @@ fn every_edit_command_works_over_the_wire_and_matches_the_local_result() {
         },
         EditCommand::RemoveChannel {
             channel: "musica".into(),
+            destination: None,
         },
         EditCommand::SetPreferredOutput(None),
         EditCommand::SetChatMixChannels(None),
+        EditCommand::AssignApp {
+            matcher: iara_core::apps::AppMatcher {
+                binary: Some("zen".into()),
+                ..Default::default()
+            },
+            channel: Some("media".into()),
+        },
+        EditCommand::AssignApp {
+            matcher: iara_core::apps::AppMatcher {
+                app_id: Some("com.discordapp.Discord".into()),
+                name: Some("Discord".into()),
+                ..Default::default()
+            },
+            channel: Some("chat".into()),
+        },
+        EditCommand::RemoveChannel {
+            channel: "chat".into(),
+            destination: Some("game".into()),
+        },
+        EditCommand::AssignApp {
+            matcher: iara_core::apps::AppMatcher {
+                binary: Some("zen".into()),
+                ..Default::default()
+            },
+            channel: None,
+        },
     ];
     let mut local = initial_profile();
     let mut last = 1;
@@ -177,6 +204,7 @@ fn rejected_commands_come_back_as_errors_with_the_reason_and_change_nothing() {
         (
             EditCommand::RemoveChannel {
                 channel: "fantasma".into(),
+                destination: None,
             },
             "fantasma",
         ),

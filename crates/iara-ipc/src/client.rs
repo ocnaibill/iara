@@ -158,7 +158,22 @@ impl Client {
             }
             E::AddChannel { id, name } => p.call("AddChannel", &(id, name))?,
             E::RenameChannel { channel, name } => p.call("RenameChannel", &(channel, name))?,
-            E::RemoveChannel { channel } => p.call("RemoveChannel", &(channel,))?,
+            E::RemoveChannel {
+                channel,
+                destination,
+            } => p.call(
+                "RemoveChannel",
+                &(channel, destination.clone().unwrap_or_default()),
+            )?,
+            E::AssignApp { matcher, channel } => p.call(
+                "AssignApp",
+                &(
+                    matcher.app_id.clone().unwrap_or_default(),
+                    matcher.binary.clone().unwrap_or_default(),
+                    matcher.name.clone().unwrap_or_default(),
+                    channel.clone().unwrap_or_default(),
+                ),
+            )?,
         };
         Ok(serial)
     }

@@ -2,8 +2,9 @@
 //! Ganho: `gain_db` (finito, −60..0) ou `silence = true`; nunca infinito em TOML (spec 5).
 
 use iara_core::{
-    topology::plan, Channel, ChatMixSetting, DevicePreference, Gain, Master, Microphone, Profile,
-    SendControl,
+    apps::{AppMatcher, Rule},
+    topology::plan,
+    Channel, ChatMixSetting, DevicePreference, Gain, Master, Microphone, Profile, SendControl,
 };
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,19 @@ pub struct DevicesDto {
     pub microphone: Option<String>,
 }
 
+/// Regra de associação: os campos de identidade presentes precisam todos casar (ao menos um).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RuleDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub channel: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileDto {
@@ -79,6 +93,8 @@ pub struct ProfileDto {
     pub devices: DevicesDto,
     #[serde(default, rename = "channels")]
     pub channels: Vec<ChannelDto>,
+    #[serde(default, rename = "rules")]
+    pub rules: Vec<RuleDto>,
 }
 
 fn send_to_dto(s: &SendControl) -> SendDto {
@@ -148,6 +164,16 @@ pub fn profile_to_dto(p: &Profile) -> ProfileDto {
                 transmission: send_to_dto(&c.transmission),
             })
             .collect(),
+        rules: p
+            .rules
+            .iter()
+            .map(|r| RuleDto {
+                app_id: r.matcher.app_id.clone(),
+                binary: r.matcher.binary.clone(),
+                name: r.matcher.name.clone(),
+                channel: r.channel.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -188,6 +214,18 @@ pub fn profile_from_dto(d: ProfileDto) -> Result<Profile, String> {
             channels: d.chatmix.channels.map(|[a, b]| (a, b)),
             position: d.chatmix.position,
         },
+        rules: d
+            .rules
+            .into_iter()
+            .map(|r| Rule {
+                matcher: AppMatcher {
+                    app_id: r.app_id,
+                    binary: r.binary,
+                    name: r.name,
+                },
+                channel: r.channel,
+            })
+            .collect(),
         preferred_output: d
             .devices
             .output

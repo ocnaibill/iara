@@ -93,6 +93,8 @@ pub struct Plan {
 pub enum PlanError {
     InvalidId(String),
     InvalidDeviceKey,
+    InvalidRule,
+    UnknownRuleChannel(String),
     DuplicateChannel(String),
     UnknownChatMixChannel(String),
     InvalidChatMix,
@@ -122,12 +124,22 @@ pub fn plan(profile: &Profile) -> Result<Plan, PlanError> {
             return Err(PlanError::InvalidDeviceKey);
         }
     }
+    for r in &profile.rules {
+        if !r.matcher.is_valid() {
+            return Err(PlanError::InvalidRule);
+        }
+    }
     for c in &profile.channels {
         if !is_valid_id(&c.id) {
             return Err(PlanError::InvalidId(c.id.clone()));
         }
         if !seen.insert(c.id.as_str()) {
             return Err(PlanError::DuplicateChannel(c.id.clone()));
+        }
+    }
+    for r in &profile.rules {
+        if !seen.contains(r.channel.as_str()) {
+            return Err(PlanError::UnknownRuleChannel(r.channel.clone()));
         }
     }
     // ChatMix: multiplicadores extras apenas nos ramos pessoais dos dois canais escolhidos.

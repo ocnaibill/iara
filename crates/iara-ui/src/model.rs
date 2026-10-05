@@ -468,6 +468,7 @@ mod tests {
             EditCommand::SetChatMixPosition(0.2),
             EditCommand::RemoveChannel {
                 channel: "aux".into(),
+                destination: None,
             },
         ];
         assert_eq!(
@@ -478,7 +479,8 @@ mod tests {
                 gain("game", -4.0),
                 EditCommand::SetChatMixPosition(0.2),
                 EditCommand::RemoveChannel {
-                    channel: "aux".into()
+                    channel: "aux".into(),
+                    destination: None
                 },
             ]
         );

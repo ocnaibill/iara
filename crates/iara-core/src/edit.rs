@@ -2,6 +2,7 @@
 //! Funcional e atômico: `apply` devolve um perfil novo já validado, ou erro sem efeito. A classe do comando
 //! (contínuo ou estrutural) diz como ele entra no histórico (spec 8.14).
 
+use crate::apps::{AppMatcher, Rule};
 use crate::topology::plan;
 use crate::{
     chatmix, is_valid_id, is_valid_text, Channel, DevicePreference, Gain, Profile, SendControl,
@@ -72,8 +73,17 @@ pub enum EditCommand {
         channel: String,
         name: String,
     },
+    /// Remove o canal; as regras que apontavam para ele vão para `destination` (outro canal) ou, com `None`, são
+    /// apagadas (os aplicativos voltam a Não atribuídos). Nunca assume um destino por conta própria (spec 8.3).
     RemoveChannel {
         channel: String,
+        destination: Option<String>,
+    },
+    /// Associa o aplicativo identificado por `matcher` a um canal (cria ou troca a regra de mesmo `matcher`);
+    /// `None` apaga a regra (o aplicativo volta a Não atribuídos).
+    AssignApp {
+        matcher: AppMatcher,
+        channel: Option<String>,
     },
 }
 
@@ -259,8 +269,27 @@ pub fn apply(profile: &Profile, cmd: &EditCommand) -> Result<(Profile, EditClass
             channel(&mut p, id)?.name = name.clone();
             EditClass::Structural
         }
-        EditCommand::RemoveChannel { channel: id } => {
+        EditCommand::RemoveChannel {
+            channel: id,
+            destination,
+        } => {
             channel(&mut p, id)?;
+            if let Some(d) = destination {
+                if d == id {
+                    return Err(EditError::InvalidValue(
+                        "o destino das regras não pode ser o canal removido",
+                    ));
+                }
+                channel(&mut p, d)?;
+            }
+            match destination {
+                Some(d) => p
+                    .rules
+                    .iter_mut()
+                    .filter(|r| &r.channel == id)
+                    .for_each(|r| r.channel = d.clone()),
+                None => p.rules.retain(|r| &r.channel != id),
+            }
             p.channels.retain(|c| &c.id != id);
             if p.chatmix
                 .channels
@@ -268,6 +297,28 @@ pub fn apply(profile: &Profile, cmd: &EditCommand) -> Result<(Profile, EditClass
                 .is_some_and(|(a, b)| a == id || b == id)
             {
                 p.chatmix.channels = None;
+            }
+            EditClass::Structural
+        }
+        EditCommand::AssignApp {
+            matcher,
+            channel: target,
+        } => {
+            if !matcher.is_valid() {
+                return Err(EditError::InvalidText);
+            }
+            match target {
+                Some(id) => {
+                    channel(&mut p, id)?;
+                    match p.rules.iter_mut().find(|r| &r.matcher == matcher) {
+                        Some(r) => r.channel = id.clone(),
+                        None => p.rules.push(Rule {
+                            matcher: matcher.clone(),
+                            channel: id.clone(),
+                        }),
+                    }
+                }
+                None => p.rules.retain(|r| &r.matcher != matcher),
             }
             EditClass::Structural
         }
@@ -455,6 +506,7 @@ mod tests {
             &p,
             &EditCommand::RemoveChannel {
                 channel: "chat".into(),
+                destination: None,
             },
         )
         .unwrap();
@@ -500,5 +552,164 @@ mod tests {
         assert!(Gain::from_db_or_silence(f64::INFINITY).is_err());
         assert!(Gain::from_db_or_silence(f64::NAN).is_err());
         assert!(Gain::from_db_or_silence(-200.0).is_err());
+    }
+
+    fn bin(b: &str) -> AppMatcher {
+        AppMatcher {
+            binary: Some(b.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn assigning_an_app_creates_replaces_and_removes_one_rule_per_matcher() {
+        let base = initial_profile();
+        let (p, class) = apply(
+            &base,
+            &EditCommand::AssignApp {
+                matcher: bin("zen"),
+                channel: Some("media".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!((class, p.rules.len()), (EditClass::Structural, 1));
+        // mover de novo troca a regra, não duplica
+        let (p, _) = apply(
+            &p,
+            &EditCommand::AssignApp {
+                matcher: bin("zen"),
+                channel: Some("game".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!((p.rules.len(), p.rules[0].channel.as_str()), (1, "game"));
+        let (p, _) = apply(
+            &p,
+            &EditCommand::AssignApp {
+                matcher: bin("cider"),
+                channel: Some("media".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(p.rules.len(), 2);
+        // None devolve o aplicativo a Não atribuídos (apaga a regra)
+        let (p, _) = apply(
+            &p,
+            &EditCommand::AssignApp {
+                matcher: bin("zen"),
+                channel: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.rules.len(), 1);
+        // erros: canal inexistente e matcher vazio ou com caractere de controle
+        assert_eq!(
+            apply(
+                &base,
+                &EditCommand::AssignApp {
+                    matcher: bin("zen"),
+                    channel: Some("fantasma".into())
+                }
+            )
+            .unwrap_err(),
+            EditError::UnknownChannel("fantasma".into())
+        );
+        assert_eq!(
+            apply(
+                &base,
+                &EditCommand::AssignApp {
+                    matcher: AppMatcher::default(),
+                    channel: Some("game".into())
+                }
+            )
+            .unwrap_err(),
+            EditError::InvalidText
+        );
+        assert_eq!(
+            apply(
+                &base,
+                &EditCommand::AssignApp {
+                    matcher: bin("a\nb"),
+                    channel: None
+                }
+            )
+            .unwrap_err(),
+            EditError::InvalidText
+        );
+    }
+
+    #[test]
+    fn removing_a_channel_moves_or_drops_its_rules_only_as_told() {
+        let base = initial_profile();
+        let (p, _) = apply(
+            &base,
+            &EditCommand::AssignApp {
+                matcher: bin("zen"),
+                channel: Some("aux".into()),
+            },
+        )
+        .unwrap();
+        let (p, _) = apply(
+            &p,
+            &EditCommand::AssignApp {
+                matcher: bin("cider"),
+                channel: Some("media".into()),
+            },
+        )
+        .unwrap();
+        // destino explícito: as regras do canal removido vão para ele; as outras ficam
+        let (moved, _) = apply(
+            &p,
+            &EditCommand::RemoveChannel {
+                channel: "aux".into(),
+                destination: Some("game".into()),
+            },
+        )
+        .unwrap();
+        let by = |p: &Profile, b: &str| {
+            p.rules
+                .iter()
+                .find(|r| r.matcher.binary.as_deref() == Some(b))
+                .map(|r| r.channel.clone())
+        };
+        assert_eq!(
+            (by(&moved, "zen").as_deref(), by(&moved, "cider").as_deref()),
+            (Some("game"), Some("media"))
+        );
+        // sem destino: as regras do canal removido somem (Não atribuídos); as outras ficam
+        let (dropped, _) = apply(
+            &p,
+            &EditCommand::RemoveChannel {
+                channel: "aux".into(),
+                destination: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (by(&dropped, "zen"), by(&dropped, "cider").as_deref()),
+            (None, Some("media"))
+        );
+        // destino inválido: o próprio canal ou um que não existe
+        assert!(matches!(
+            apply(
+                &p,
+                &EditCommand::RemoveChannel {
+                    channel: "aux".into(),
+                    destination: Some("aux".into())
+                }
+            ),
+            Err(EditError::InvalidValue(_))
+        ));
+        assert_eq!(
+            apply(
+                &p,
+                &EditCommand::RemoveChannel {
+                    channel: "aux".into(),
+                    destination: Some("fantasma".into())
+                }
+            )
+            .unwrap_err(),
+            EditError::UnknownChannel("fantasma".into())
+        );
     }
 }

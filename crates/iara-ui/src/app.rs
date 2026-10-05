@@ -347,6 +347,7 @@ fn manage_menu(
             if b.label().as_deref() == Some("Confirmar remoção") {
                 e(EditCommand::RemoveChannel {
                     channel: id.clone(),
+                    destination: None,
                 });
                 pop_c.popdown();
             } else {

@@ -1,5 +1,6 @@
 //! Domínio compartilhado; sem dependência de GTK, PipeWire ou IPC.
 
+pub mod apps;
 pub mod edit;
 pub mod topology;
 
@@ -137,6 +138,8 @@ pub struct Profile {
     pub microphone: Microphone,
     pub master: Master,
     pub chatmix: ChatMixSetting,
+    /// Regras de associação de aplicativos a canais (spec 8.1).
+    pub rules: Vec<apps::Rule>,
     pub preferred_output: Option<DevicePreference>,
     pub preferred_microphone: Option<DevicePreference>,
 }
@@ -192,6 +195,7 @@ pub fn initial_profile() -> Profile {
             channels: Some(("game".into(), "chat".into())),
             position: 0.0,
         },
+        rules: Vec::new(),
         preferred_output: None,
         preferred_microphone: None,
     }

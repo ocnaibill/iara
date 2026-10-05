@@ -715,6 +715,7 @@ mod tests {
         assert!(rx.try_recv().unwrap().unwrap_err().contains("ChatMix"));
         let (msg, rx) = edit(EditCommand::RemoveChannel {
             channel: "fantasma".into(),
+            destination: None,
         });
         svc.handle(msg, t0);
         assert!(rx.try_recv().unwrap().unwrap_err().contains("fantasma"));

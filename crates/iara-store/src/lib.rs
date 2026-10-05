@@ -463,6 +463,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iara_core::apps::{AppMatcher, Rule};
     use iara_core::{initial_profile, DevicePreference, Gain};
 
     fn store() -> (tempfile::TempDir, Store) {
@@ -480,6 +481,23 @@ mod tests {
         p.channels[2].personal.muted = true;
         p.microphone.input_gain = Gain::SILENCE;
         p.chatmix.position = -0.25;
+        p.rules = vec![
+            Rule {
+                matcher: AppMatcher {
+                    binary: Some("zen".into()),
+                    ..Default::default()
+                },
+                channel: "media".into(),
+            },
+            Rule {
+                matcher: AppMatcher {
+                    app_id: Some("com.discordapp.Discord".into()),
+                    name: Some("Discord".into()),
+                    ..Default::default()
+                },
+                channel: "chat".into(),
+            },
+        ];
         p.preferred_output = Some(DevicePreference {
             persistent_key: "alsa_output.fone".into(),
         });
@@ -652,6 +670,55 @@ mod tests {
         let mut bad = p.clone();
         bad.chatmix.position = f64::NAN;
         assert!(profile_to_toml(&bad).is_err());
+    }
+
+    #[test]
+    fn rules_round_trip_in_order_and_hostile_rules_are_rejected() {
+        let (_d, s) = store();
+        let mut p = initial_profile();
+        p.rules = vec![Rule {
+            matcher: AppMatcher {
+                binary: Some("zen".into()),
+                ..Default::default()
+            },
+            channel: "media".into(),
+        }];
+        s.save_profile(&p).unwrap();
+        let text = fs::read_to_string(s.profile_file("default")).unwrap();
+        assert!(
+            text.contains("[[rules]]") && text.contains("binary = \"zen\""),
+            "{text}"
+        );
+        assert_eq!(s.load_profile("default").unwrap().0.rules, p.rules);
+        // regra vazia, com caractere de controle ou para canal inexistente: recusadas na leitura e na gravação
+        for bad in [
+            ("[[rules]]\nchannel = \"media\"\n", "regra sem campo"),
+            (
+                "[[rules]]\nbinary = \"a\\nb\"\nchannel = \"media\"\n",
+                "controle",
+            ),
+            (
+                "[[rules]]\nbinary = \"zen\"\nchannel = \"fantasma\"\n",
+                "canal inexistente",
+            ),
+            (
+                "[[rules]]\nbinary = \"zen\"\nchannel = \"media\"\nextra = 1\n",
+                "campo desconhecido",
+            ),
+        ] {
+            let text = format!(
+                "{}\n{}",
+                profile_to_toml(&initial_profile()).unwrap(),
+                bad.0
+            );
+            assert!(profile_from_toml(&text).is_err(), "{}", bad.1);
+        }
+        let mut broken = initial_profile();
+        broken.rules = vec![Rule {
+            matcher: AppMatcher::default(),
+            channel: "media".into(),
+        }];
+        assert!(s.save_profile(&broken).is_err());
     }
 
     #[test]
