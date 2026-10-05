@@ -1,5 +1,7 @@
 //! Domínio compartilhado; sem dependência de GTK, PipeWire ou IPC.
 
+pub mod topology;
+
 pub const HISTORY_LIMIT: usize = 50;
 pub const SPEC_VERSION: &str = "0.10";
 
@@ -86,12 +88,29 @@ pub struct DevicePreference {
     pub persistent_key: String,
 }
 
+/// MASTER age depois da soma de cada mix (ganho e mute próprios por mix).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Master {
+    pub personal: SendControl,
+    pub transmission: SendControl,
+}
+
+/// Par de canais (ids) equilibrado pelo ChatMix e posição atual em [-1, 1];
+/// -1 favorece o primeiro canal, +1 o segundo. `channels = None` desativa o ChatMix.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatMixSetting {
+    pub channels: Option<(String, String)>,
+    pub position: f64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
     pub id: String,
     pub name: String,
     pub channels: Vec<Channel>,
     pub microphone: Microphone,
+    pub master: Master,
+    pub chatmix: ChatMixSetting,
     pub preferred_output: Option<DevicePreference>,
     pub preferred_microphone: Option<DevicePreference>,
 }
@@ -138,6 +157,14 @@ pub fn initial_profile() -> Profile {
             personal: send(false),
             transmission: send(true),
             applications: send(true),
+        },
+        master: Master {
+            personal: send(true),
+            transmission: send(true),
+        },
+        chatmix: ChatMixSetting {
+            channels: Some(("game".into(), "chat".into())),
+            position: 0.0,
         },
         preferred_output: None,
         preferred_microphone: None,
