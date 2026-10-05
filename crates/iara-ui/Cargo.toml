@@ -10,5 +10,6 @@ gtk-ui = ["dep:gtk"]
 
 [dependencies]
 iara-core.workspace = true
+iara-ipc = { path = "../iara-ipc" }
 gtk = { package = "gtk4", version = "0.10", optional = true }
 
