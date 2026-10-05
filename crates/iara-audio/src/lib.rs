@@ -7,4 +7,4 @@
 
 mod engine;
 
-pub use engine::{ApplyReport, Engine, EngineError, Event};
+pub use engine::{ApplyReport, Engine, EngineError, Event, EventSink};

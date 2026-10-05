@@ -243,6 +243,27 @@ O módulo loopback se descarrega sozinho com `dont-fallback`; um listener do eve
 Limites: a chave do dispositivo é o `node.name` (identificação persistente em aberto, spec 14); a escolha de alternativa autorizada, a geração da
 escolha e a política de “não forçar reprodução” ficam para o serviço; o motor só informa presença/ausência.
 
+## Prova 11 — serviço real: início, reinício do PipeWire e encerramento
+
+Script: `tools/provas/11-servico-e2e.sh` (diretórios XDG isolados; reinicia o PipeWire da sessão do usuário).
+O serviço (`iara-service`) carrega ou cria o perfil ativo, conecta o motor, aplica o plano e espera num único canal por comandos e eventos
+do motor, acordando só para prazos (autosave 300 ms, fechamento de gesto 2 s, reconexão com espera 1/2/4/8/10 s).
+
+| Etapa | Resultado |
+| --- | --- |
+| Início | 42 nós em 0,1 s; `default.toml` criado no diretório isolado |
+| `systemctl --user restart pipewire` | comando durou 0,1 s; saída física amostrada ausente por ~0,2 s (amostragem de 100 ms) |
+| Reconexão do serviço | nós do Iara abaixo de 42 de 0,0 s a 1,0 s; **de volta a 42 em 1,1 s**; máximo amostrado 42 (**sem duplicar**); serviço vivo |
+| Log | `conexão com o PipeWire perdida; reconectando` → `reconectado ao PipeWire; reaplicando o perfil` |
+| SIGTERM | código de saída 0; 0 nós `iara.*` |
+
+Os testes unitários (`cargo test -p iara-service`) cobrem, com relógio sintético e backend falso: perfil padrão criado/reaproveitado e nunca sobrescrito se
+ilegível, backoff da conexão, reaplicação do **perfil atual** após queda (por evento ou por falha do `apply`), autosave e agrupamento do histórico (20 passos de slider =
+1 revisão), revisão estrutural imediata, flush ao desligar, perfil inválido recusado e falha de gravação visível no estado.
+
+Limites: o reinício de PipeWire testado é o do systemd (rápido por ativação de socket); queda abrupta do daemon, reinícios repetidos e o reencaminhamento dos fluxos
+associados por regra (não há regras ainda) não foram exercitados. Sem IPC: o serviço ainda não aceita comandos de uma interface.
+
 ### O que isto NÃO prova
 
 - Medições longas (horas), CPU com medidores de nível ativos e com efeitos; o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.

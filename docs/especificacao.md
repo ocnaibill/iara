@@ -464,3 +464,4 @@ Consultadas em 05/10/2026. Fundamentam capacidades existentes; os comportamentos
 - **0.10.2 — 05/10/2026:** provas 04–05 registradas; ciclo de vida dos streams de dispositivos físicos fica sob controle do serviço (6.3.1.3).
 - **0.10.3 — 05/10/2026:** motor `iara-audio` validado ponta a ponta; fontes virtuais como `Audio/Source` (defeito do PipeWire 1.6.9 com `Audio/Source/Virtual`, 6.3.1.4).
 - **0.10.4 — 05/10/2026:** persistência implementada (`iara-store`): schema 1, gravação atômica com `.bak` válido, histórico FIFO de 50 revisões, importação sem sobrescrever; ids `[a-z0-9_-]` (1–32) e textos sem caracteres de controle validados no core e escapados nos argumentos do PipeWire (perfis importados são entrada não confiável).
+- **0.10.5 — 05/10/2026:** serviço implementado (`iara-service`): perfil ativo, supervisão do motor com reconexão, autosave 300 ms e agrupamento de histórico 2 s; reinício do PipeWire recuperado em ~1 s sem duplicar nós (prova 11).

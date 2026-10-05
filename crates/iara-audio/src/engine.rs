@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::io::Cursor;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -52,7 +52,7 @@ pub enum Event {
 
 /// Resultado de uma aplicação. `missing` lista os nós esperados que não apareceram no registro dentro do prazo;
 /// “aplicado” só vale quando vazio. Ganho/mute são enviados ao nó, mas não relidos (a leitura é medida nas provas).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyReport {
     pub observed: usize,
     pub missing: Vec<String>,
@@ -73,26 +73,43 @@ enum Command {
     Shutdown,
 }
 
+/// Destino dos eventos do motor. Chamado na thread do motor: deve ser rápido e não bloquear (ex.: enviar a um canal).
+pub type EventSink = Arc<dyn Fn(Event) + Send + Sync>;
+
 pub struct Engine {
     tx: pw::channel::Sender<Command>,
-    events: mpsc::Receiver<Event>,
+    /// Só existe quando o motor foi iniciado com `start()`; com `start_with` os eventos vão ao sink do chamador.
+    events: Option<mpsc::Receiver<Event>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Engine {
     /// Conecta ao PipeWire da sessão; falha se o daemon não estiver acessível.
     pub fn start() -> Result<Self, EngineError> {
-        let (tx, rx) = pw::channel::channel::<Command>();
         let (ev_tx, events) = mpsc::channel();
+        let ev_tx = std::sync::Mutex::new(ev_tx);
+        let sink: EventSink = Arc::new(move |e| {
+            if let Ok(tx) = ev_tx.lock() {
+                let _ = tx.send(e);
+            }
+        });
+        let mut engine = Self::start_with(sink)?;
+        engine.events = Some(events);
+        Ok(engine)
+    }
+
+    /// Como `start`, mas entrega os eventos ao `sink` (ex.: o canal único do serviço, para esperar sem polling).
+    pub fn start_with(sink: EventSink) -> Result<Self, EngineError> {
+        let (tx, rx) = pw::channel::channel::<Command>();
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("iara-audio".into())
-            .spawn(move || run(rx, ev_tx, ready_tx))
+            .spawn(move || run(rx, sink, ready_tx))
             .map_err(|e| EngineError::Connect(e.to_string()))?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 tx,
-                events,
+                events: None,
                 thread: Some(thread),
             }),
             Ok(Err(m)) => Err(EngineError::Connect(m)),
@@ -111,8 +128,9 @@ impl Engine {
         reply_rx.recv().map_err(|_| EngineError::Disconnected)?
     }
 
-    pub fn events(&self) -> &mpsc::Receiver<Event> {
-        &self.events
+    /// Eventos acumulados (só para motores criados com `start()`).
+    pub fn events(&self) -> impl Iterator<Item = Event> + '_ {
+        self.events.iter().flat_map(|r| r.try_iter())
     }
 }
 
@@ -324,7 +342,7 @@ fn device_present(st: &State, d: &DeviceLink) -> bool {
 
 /// Cria/remove as ligações com dispositivos físicos conforme a presença no registro. Nunca recria com outro
 /// dispositivo: o plano é a única fonte do dispositivo preferido (a escolha do usuário durante a ausência é um novo plano).
-fn reconcile_devices(st: &mut State, context: &pw::context::ContextRc, ev: &mpsc::Sender<Event>) {
+fn reconcile_devices(st: &mut State, context: &pw::context::ContextRc, ev: &EventSink) {
     let desired = st.devices.clone();
     let stale: Vec<String> = st
         .device_modules
@@ -343,10 +361,10 @@ fn reconcile_devices(st: &mut State, context: &pw::context::ContextRc, ev: &mpsc
         let present = device_present(st, d);
         match (st.device_present.insert(d.name.clone(), present), present) {
             (None | Some(true), false) => {
-                let _ = ev.send(Event::DeviceAbsent(d.physical.clone()));
+                ev(Event::DeviceAbsent(d.physical.clone()));
             }
             (Some(false), true) => {
-                let _ = ev.send(Event::DeviceBack(d.physical.clone()));
+                ev(Event::DeviceBack(d.physical.clone()));
             }
             _ => {}
         }
@@ -402,7 +420,7 @@ fn check_pending(state: &Rc<RefCell<State>>, force: bool) {
 
 fn run(
     rx: pw::channel::Receiver<Command>,
-    ev_tx: mpsc::Sender<Event>,
+    ev_tx: EventSink,
     ready: mpsc::Sender<Result<(), String>>,
 ) {
     pw::init();
@@ -434,7 +452,7 @@ fn run(
                 // -EPIPE no objeto core: o daemon fechou a conexão (reinício ou queda do PipeWire).
                 if id == pw::core::PW_ID_CORE && res == -32 {
                     dc.set(true);
-                    let _ = ev.send(Event::Disconnected);
+                    ev(Event::Disconnected);
                     ml.quit();
                 }
             })
@@ -526,7 +544,7 @@ fn apply(
     state: &Rc<RefCell<State>>,
     core: &pw::core::CoreRc,
     context: &pw::context::ContextRc,
-    ev: &mpsc::Sender<Event>,
+    ev: &EventSink,
     plan: Plan,
     reply: Reply,
 ) {

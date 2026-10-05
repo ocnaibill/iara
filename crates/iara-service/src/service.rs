@@ -1,0 +1,578 @@
+//! O serviço: dono do perfil ativo, supervisor do motor de áudio e do autosave. Orientado a eventos: espera por
+//! comandos e eventos do motor num único canal, acordando só para os prazos (autosave, fechamento de gesto, reconexão).
+//! O tempo entra por parâmetro (`handle`, `tick`) para testar sem dormir; `run` liga ao relógio real.
+
+use crate::tracker::{Action, EditKind, EditTracker};
+use iara_audio::{ApplyReport, Engine, EngineError, Event, EventSink};
+use iara_core::topology::{plan, Plan};
+use iara_core::{initial_profile, Profile};
+use iara_store::{GlobalConfig, Store, StoreError};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// Esperas entre tentativas de reconectar ao PipeWire (a última se repete).
+const BACKOFF: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(10),
+];
+
+pub trait Backend {
+    fn apply(&mut self, plan: Plan) -> Result<ApplyReport, EngineError>;
+}
+
+impl Backend for Engine {
+    fn apply(&mut self, plan: Plan) -> Result<ApplyReport, EngineError> {
+        Engine::apply(self, plan)
+    }
+}
+
+pub enum Command {
+    /// Estado completo desejado do perfil ativo e o tipo de edição (para o histórico).
+    SetProfile {
+        profile: Box<Profile>,
+        kind: EditKind,
+    },
+    /// Grava e fecha o gesto agora (concluir gesto, trocar de perfil).
+    Flush,
+    Shutdown,
+}
+
+pub enum Msg {
+    Command(Command),
+    Engine(Event),
+}
+
+pub type Connector<B> = Box<dyn FnMut(EventSink) -> Result<B, EngineError>>;
+
+#[derive(Debug)]
+pub enum ServiceError {
+    Store(StoreError),
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ServiceError {}
+
+impl From<StoreError> for ServiceError {
+    fn from(e: StoreError) -> Self {
+        Self::Store(e)
+    }
+}
+
+/// O que a interface precisa mostrar (spec 6.2, 8.10): conexão, falha de gravação, último relatório, dispositivos ausentes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Status {
+    pub connected: bool,
+    pub persist_error: Option<String>,
+    pub last_report: Option<ApplyReport>,
+    pub absent_devices: Vec<String>,
+    pub reconnect_attempts: u32,
+}
+
+pub struct Service<B: Backend> {
+    store: Store,
+    profile: Profile,
+    tracker: EditTracker,
+    backend: Option<B>,
+    connect: Connector<B>,
+    sink: EventSink,
+    retry: Option<(Instant, u32)>,
+    status: Status,
+    stopped: bool,
+}
+
+/// Perfil ativo da configuração; sem nenhum, usa o primeiro existente ou cria o padrão. Nunca sobrescreve um perfil
+/// ilegível: se o arquivo existe mas não carrega (nem pela cópia), devolve o erro.
+fn load_or_create_profile(store: &Store) -> Result<Profile, ServiceError> {
+    let (mut config, _) = store.load_config()?;
+    let candidates = config
+        .active_profile
+        .clone()
+        .into_iter()
+        .chain(store.list_profiles()?)
+        .collect::<Vec<_>>();
+    for id in candidates {
+        match store.load_profile(&id) {
+            Ok((p, _)) => {
+                if config.active_profile.as_deref() != Some(&p.id) {
+                    config.active_profile = Some(p.id.clone());
+                    store.save_config(&config)?;
+                }
+                return Ok(p);
+            }
+            Err(StoreError::NotFound(_)) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let p = initial_profile();
+    store.save_profile(&p)?;
+    store.save_config(&GlobalConfig {
+        active_profile: Some(p.id.clone()),
+        ..config
+    })?;
+    Ok(p)
+}
+
+impl<B: Backend> Service<B> {
+    pub fn new(store: Store, connect: Connector<B>, sink: EventSink) -> Result<Self, ServiceError> {
+        let profile = load_or_create_profile(&store)?;
+        Ok(Self {
+            store,
+            profile,
+            tracker: EditTracker::default(),
+            backend: None,
+            connect,
+            sink,
+            retry: None,
+            status: Status::default(),
+            stopped: false,
+        })
+    }
+
+    pub fn profile(&self) -> &Profile {
+        &self.profile
+    }
+
+    pub fn status(&self) -> &Status {
+        &self.status
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
+    pub fn start(&mut self, now: Instant) {
+        self.try_connect(now);
+    }
+
+    fn try_connect(&mut self, now: Instant) {
+        match (self.connect)(self.sink.clone()) {
+            Ok(backend) => {
+                if self.status.reconnect_attempts > 0 {
+                    eprintln!("iara: reconectado ao PipeWire; reaplicando o perfil");
+                }
+                self.backend = Some(backend);
+                self.retry = None;
+                self.status.connected = true;
+                self.status.reconnect_attempts = 0;
+                self.apply_current(now);
+            }
+            Err(e) => {
+                eprintln!("iara: sem conexão com o áudio ({e}); nova tentativa em breve");
+                self.schedule_retry(now);
+            }
+        }
+    }
+
+    fn schedule_retry(&mut self, now: Instant) {
+        let attempt = self.retry.map_or(0, |(_, a)| a + 1);
+        let delay = BACKOFF[(attempt as usize).min(BACKOFF.len() - 1)];
+        self.retry = Some((now + delay, attempt));
+        self.status.reconnect_attempts = attempt + 1;
+    }
+
+    fn drop_backend(&mut self, now: Instant) {
+        eprintln!("iara: conexão com o PipeWire perdida; reconectando");
+        self.backend = None; // o Engine remove os próprios objetos ao ser descartado
+        self.status.connected = false;
+        self.status.absent_devices.clear();
+        if self.retry.is_none() {
+            self.retry = Some((now + BACKOFF[0], 0));
+            self.status.reconnect_attempts = 1;
+        }
+    }
+
+    fn apply_current(&mut self, now: Instant) {
+        let Ok(plan) = plan(&self.profile) else {
+            return;
+        };
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        match backend.apply(plan) {
+            Ok(report) => {
+                if !report.is_complete() {
+                    eprintln!("iara: aplicação parcial, ausentes: {:?}", report.missing);
+                }
+                self.status.last_report = Some(report);
+            }
+            Err(EngineError::Disconnected) => self.drop_backend(now),
+            Err(e) => eprintln!("iara: falha ao aplicar o perfil: {e}"),
+        }
+    }
+
+    fn execute(&mut self, actions: Vec<Action>) {
+        for action in actions {
+            let result = match action {
+                Action::Save => self.store.save_profile(&self.profile),
+                Action::PushRevision(previous, reason) => {
+                    self.store.push_revision(&previous, reason).map(|_| ())
+                }
+            };
+            match result {
+                Ok(()) => {
+                    if self.status.persist_error.is_some() && self.tracker.next_deadline().is_none()
+                    {
+                        self.status.persist_error = None;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("iara: falha ao gravar: {e}");
+                    self.status.persist_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    pub fn handle(&mut self, msg: Msg, now: Instant) {
+        match msg {
+            Msg::Command(Command::SetProfile { profile, kind }) => {
+                if let Err(e) = plan(&profile) {
+                    eprintln!("iara: perfil recusado: {e:?}");
+                    return;
+                }
+                let previous = std::mem::replace(&mut self.profile, *profile);
+                self.apply_current(now);
+                let actions = self.tracker.on_edit(&previous, kind, now);
+                self.execute(actions);
+            }
+            Msg::Command(Command::Flush) => {
+                let actions = self.tracker.flush();
+                self.execute(actions);
+            }
+            Msg::Command(Command::Shutdown) => {
+                let actions = self.tracker.flush();
+                self.execute(actions);
+                self.backend = None;
+                self.status.connected = false;
+                self.stopped = true;
+            }
+            Msg::Engine(Event::Disconnected) => self.drop_backend(now),
+            Msg::Engine(Event::DeviceAbsent(d)) => {
+                if !self.status.absent_devices.contains(&d) {
+                    self.status.absent_devices.push(d);
+                }
+            }
+            Msg::Engine(Event::DeviceBack(d)) => self.status.absent_devices.retain(|x| *x != d),
+        }
+    }
+
+    pub fn tick(&mut self, now: Instant) {
+        if self.retry.is_some_and(|(at, _)| now >= at) {
+            self.try_connect(now);
+        }
+        let actions = self.tracker.on_tick(now);
+        self.execute(actions);
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        [self.tracker.next_deadline(), self.retry.map(|(at, _)| at)]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Laço principal: dorme até o próximo prazo ou mensagem; sem prazos, espera só por mensagens.
+    pub fn run(&mut self, rx: &mpsc::Receiver<Msg>) {
+        self.start(Instant::now());
+        while !self.stopped {
+            let msg = match self.next_deadline() {
+                Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
+                None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            };
+            match msg {
+                Ok(m) => self.handle(m, Instant::now()),
+                Err(mpsc::RecvTimeoutError::Timeout) => self.tick(Instant::now()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.handle(Msg::Command(Command::Shutdown), Instant::now());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tracker::{AUTOSAVE_DELAY, GROUP_IDLE};
+    use iara_core::Gain;
+    use iara_store::RevisionReason;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct World {
+        applied: RefCell<Vec<Plan>>,
+        connects: Cell<u32>,
+        fail_connects: Cell<u32>,
+        fail_apply_disconnected: Cell<bool>,
+    }
+
+    struct Fake(Rc<World>);
+
+    impl Backend for Fake {
+        fn apply(&mut self, plan: Plan) -> Result<ApplyReport, EngineError> {
+            if self.0.fail_apply_disconnected.get() {
+                return Err(EngineError::Disconnected);
+            }
+            self.0.applied.borrow_mut().push(plan);
+            Ok(ApplyReport {
+                observed: 1,
+                missing: vec![],
+                absent_devices: vec![],
+            })
+        }
+    }
+
+    fn service(dir: &tempfile::TempDir) -> (Service<Fake>, Rc<World>) {
+        let world = Rc::new(World::default());
+        let w = world.clone();
+        let connect: Connector<Fake> = Box::new(move |_sink| {
+            w.connects.set(w.connects.get() + 1);
+            if w.fail_connects.get() > 0 {
+                w.fail_connects.set(w.fail_connects.get() - 1);
+                return Err(EngineError::Connect("sem daemon".into()));
+            }
+            Ok(Fake(w.clone()))
+        });
+        let store = Store::open(dir.path().join("config"), dir.path().join("state"));
+        let sink: EventSink = Arc::new(|_| {});
+        (Service::new(store, connect, sink).unwrap(), world)
+    }
+
+    fn set(profile: &Profile, kind: EditKind) -> Msg {
+        Msg::Command(Command::SetProfile {
+            profile: Box::new(profile.clone()),
+            kind,
+        })
+    }
+
+    fn s(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn first_run_creates_and_reuses_the_default_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (svc, _) = service(&dir);
+        assert_eq!(svc.profile().id, "default");
+        let store = Store::open(dir.path().join("config"), dir.path().join("state"));
+        assert_eq!(store.list_profiles().unwrap(), ["default"]);
+        assert_eq!(
+            store.load_config().unwrap().0.active_profile.as_deref(),
+            Some("default")
+        );
+        // segunda execução: mesmo perfil, sem recriar
+        let mut p = store.load_profile("default").unwrap().0;
+        p.channels[0].personal.gain = Gain::from_db(-9.0).unwrap();
+        store.save_profile(&p).unwrap();
+        let (svc2, _) = service(&dir);
+        assert_eq!(svc2.profile().channels[0].personal.gain.db(), Some(-9.0));
+    }
+
+    #[test]
+    fn an_unreadable_profile_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_svc, _) = service(&dir);
+        let file = dir.path().join("config/profiles/default.toml");
+        std::fs::write(&file, "lixo [").unwrap();
+        std::fs::write(
+            dir.path().join("config/profiles/default.toml.bak"),
+            "lixo também",
+        )
+        .unwrap();
+        let store = Store::open(dir.path().join("config"), dir.path().join("state"));
+        let connect: Connector<Fake> = Box::new(|_| Err(EngineError::Disconnected));
+        assert!(Service::new(store, connect, Arc::new(|_| {})).is_err());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "lixo [");
+    }
+
+    #[test]
+    fn connect_failures_back_off_and_the_first_success_applies_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        world.fail_connects.set(3);
+        let t0 = Instant::now();
+        svc.start(t0);
+        assert!(!svc.status().connected);
+        assert_eq!(svc.next_deadline(), Some(t0 + s(1)));
+        svc.tick(t0 + s(1)); // 2ª tentativa falha → espera 2 s
+        assert_eq!(svc.next_deadline(), Some(t0 + s(1) + s(2)));
+        svc.tick(t0 + s(3)); // 3ª falha → 4 s
+        assert_eq!(svc.next_deadline(), Some(t0 + s(3) + s(4)));
+        assert_eq!(world.connects.get(), 3);
+        svc.tick(t0 + s(7)); // 4ª tentativa conecta
+        assert!(svc.status().connected && svc.next_deadline().is_none());
+        assert_eq!(world.applied.borrow().len(), 1);
+        assert!(svc.status().last_report.as_ref().unwrap().is_complete());
+    }
+
+    #[test]
+    fn after_a_disconnect_the_service_reconnects_and_reapplies_the_current_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        let mut p = svc.profile().clone();
+        p.channels[1].personal.muted = true;
+        svc.handle(set(&p, EditKind::Continuous), t0);
+        assert_eq!(world.applied.borrow().len(), 2);
+
+        svc.tick(t0 + s(3)); // autosave e fechamento do gesto vencem antes; só sobra o prazo de reconexão
+        svc.handle(Msg::Engine(Event::Disconnected), t0 + s(5));
+        assert!(!svc.status().connected);
+        assert_eq!(
+            svc.next_deadline().map(|d| d.duration_since(t0)),
+            Some(s(6))
+        );
+        svc.tick(t0 + s(6));
+        assert!(svc.status().connected);
+        let applied = world.applied.borrow();
+        assert_eq!(applied.len(), 3);
+        // reaplicou o perfil ATUAL (com o mute), não o do início
+        let chat = iara_core::topology::channel_node("chat");
+        let branch = applied[2]
+            .branches
+            .iter()
+            .find(|b| b.from == chat && b.to == iara_core::topology::MIX_PERSONAL)
+            .unwrap();
+        assert!(branch.muted);
+    }
+
+    #[test]
+    fn a_disconnect_reported_by_apply_also_triggers_reconnection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        world.fail_apply_disconnected.set(true);
+        let mut p = svc.profile().clone();
+        p.microphone.global_mute = true;
+        svc.handle(set(&p, EditKind::Continuous), t0 + s(1));
+        assert!(!svc.status().connected && svc.next_deadline().is_some());
+        world.fail_apply_disconnected.set(false);
+        svc.tick(t0 + s(2));
+        assert!(svc.status().connected);
+    }
+
+    #[test]
+    fn autosave_and_history_follow_the_timers_and_never_block_on_the_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, _) = service(&dir);
+        let store = Store::open(dir.path().join("config"), dir.path().join("state"));
+        let t0 = Instant::now();
+        svc.start(t0);
+        let original = svc.profile().clone();
+        let mut p = original.clone();
+        for i in 1..=20u32 {
+            p.channels[0].personal.gain = Gain::from_db(-f64::from(i)).unwrap();
+            svc.handle(
+                set(&p, EditKind::Continuous),
+                t0 + Duration::from_millis(u64::from(i) * 10),
+            );
+        }
+        let last = t0 + Duration::from_millis(200);
+        // antes de 300 ms do último ajuste: disco ainda no estado antigo
+        svc.tick(last + AUTOSAVE_DELAY - Duration::from_millis(1));
+        assert_eq!(store.load_profile("default").unwrap().0, original);
+        svc.tick(last + AUTOSAVE_DELAY);
+        assert_eq!(store.load_profile("default").unwrap().0, p);
+        assert!(
+            store.list_revisions("default").unwrap().is_empty(),
+            "o gesto ainda está aberto"
+        );
+        svc.tick(last + GROUP_IDLE);
+        let revs = store.list_revisions("default").unwrap();
+        assert_eq!(revs.len(), 1, "20 passos = uma revisão");
+        assert_eq!(revs[0].reason, RevisionReason::Adjustment);
+        assert_eq!(
+            store.load_revision("default", revs[0].seq).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn structural_edits_and_shutdown_flush_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, _) = service(&dir);
+        let store = Store::open(dir.path().join("config"), dir.path().join("state"));
+        let t0 = Instant::now();
+        svc.start(t0);
+        let mut p = svc.profile().clone();
+        p.channels.retain(|c| c.id != "aux");
+        p.chatmix.position = 0.0;
+        svc.handle(
+            set(&p, EditKind::Structural(RevisionReason::Structural)),
+            t0,
+        );
+        assert_eq!(
+            store.list_revisions("default").unwrap().len(),
+            1,
+            "revisão estrutural imediata"
+        );
+        // desligar antes do autosave vencer: grava mesmo assim
+        svc.handle(
+            Msg::Command(Command::Shutdown),
+            t0 + Duration::from_millis(10),
+        );
+        assert!(svc.is_stopped());
+        assert!(store
+            .load_profile("default")
+            .unwrap()
+            .0
+            .channels
+            .iter()
+            .all(|c| c.id != "aux"));
+    }
+
+    #[test]
+    fn an_invalid_profile_is_refused_and_a_write_failure_is_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        let mut bad = svc.profile().clone();
+        bad.chatmix.position = 5.0;
+        svc.handle(set(&bad, EditKind::Continuous), t0);
+        assert_eq!(svc.profile().chatmix.position, 0.0);
+        assert_eq!(world.applied.borrow().len(), 1, "nada foi aplicado");
+        assert!(svc.next_deadline().is_none());
+
+        // diretório de perfis vira arquivo: a gravação falha e o estado de persistência mostra isso
+        let profiles = dir.path().join("config/profiles");
+        std::fs::remove_dir_all(&profiles).unwrap();
+        std::fs::write(&profiles, "x").unwrap();
+        let mut p = svc.profile().clone();
+        p.microphone.global_mute = true;
+        svc.handle(set(&p, EditKind::Continuous), t0);
+        svc.tick(t0 + AUTOSAVE_DELAY);
+        assert!(svc.status().persist_error.is_some());
+        assert!(
+            svc.profile().microphone.global_mute,
+            "o estado em memória segue aplicado"
+        );
+    }
+
+    #[test]
+    fn device_events_are_tracked_for_the_interface() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, _) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        svc.handle(Msg::Engine(Event::DeviceAbsent("fone".into())), t0);
+        svc.handle(Msg::Engine(Event::DeviceAbsent("fone".into())), t0);
+        assert_eq!(svc.status().absent_devices, ["fone"]);
+        svc.handle(Msg::Engine(Event::DeviceBack("fone".into())), t0);
+        assert!(svc.status().absent_devices.is_empty());
+    }
+}

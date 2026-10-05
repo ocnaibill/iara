@@ -6,4 +6,9 @@ license.workspace = true
 
 [dependencies]
 iara-core.workspace = true
+iara-audio = { path = "../iara-audio" }
+iara-store = { path = "../iara-store" }
+signal-hook = "0.3"
 
+[dev-dependencies]
+tempfile = "3"

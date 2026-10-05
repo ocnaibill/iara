@@ -79,7 +79,7 @@ fn main() {
                 true
             }
             ["events", ..] => {
-                for e in engine.events().try_iter() {
+                for e in engine.events() {
                     println!("evento {e:?}");
                 }
                 println!("fim-eventos");

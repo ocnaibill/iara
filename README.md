@@ -9,7 +9,7 @@ O motor `iara-audio` cria nós virtuais `iara.*` no PipeWire da sessão enquanto
 - `iara-core`: domínio compartilhado, ganhos, envios, fórmula do ChatMix e plano de topologia (`topology`: perfil → nós e ramos, diff); sem GTK/PipeWire.
 - `iara-store`: persistência em TOML versionado (perfis, configuração, histórico de 50 revisões), gravação atômica com cópia válida anterior, duplicação, importação e exportação; valida tudo na entrada.
 - `iara-audio`: motor PipeWire; aplica um plano por diferença no próprio processo (nós, loopbacks, ganho/mute por Props). Precisa de libpipewire e clang.
-- `iara-service`: ponto de entrada do serviço e contrato provisório do backend.
+- `iara-service`: serviço de sessão: perfil ativo, supervisão e reconexão do motor, autosave e histórico. Ainda sem IPC.
 - `iara-ui`: ponto de entrada GTK4, habilitado por feature para separar dependências nativas.
 
 As provas da spec 6.3.2 estão em `docs/provas/registro.md` e `tools/provas/`; `tools/provas/07-motor-e2e.sh` exercita o motor real de ponta a ponta (cria nós temporários na sessão, mede e remove).
