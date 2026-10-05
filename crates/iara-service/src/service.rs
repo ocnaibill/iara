@@ -4,9 +4,10 @@
 
 use crate::tracker::{Action, EditKind, EditTracker};
 use iara_audio::{ApplyReport, Engine, EngineError, Event, EventSink};
+use iara_core::edit::{self, EditClass, EditCommand};
 use iara_core::topology::{plan, Plan};
 use iara_core::{initial_profile, Profile};
-use iara_store::{GlobalConfig, Store, StoreError};
+use iara_store::{GlobalConfig, RevisionReason, Store, StoreError};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -29,8 +30,28 @@ impl Backend for Engine {
     }
 }
 
+/// Resposta a um comando: o serviço responde por este canal (o IPC espera nele com prazo).
+pub type Reply<T> = mpsc::Sender<T>;
+
+/// Retrato completo do estado do serviço para uma interface: versão que só cresce, perfil ativo e status.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Snapshot {
+    pub serial: u64,
+    pub profile: Profile,
+    pub status: Status,
+}
+
 pub enum Command {
-    /// Estado completo desejado do perfil ativo e o tipo de edição (para o histórico).
+    /// Edição granular do perfil ativo (a forma normal de a interface mudar o estado): responde com a nova versão ou o erro.
+    Edit {
+        cmd: EditCommand,
+        reply: Option<Reply<Result<u64, String>>>,
+    },
+    /// Retrato atual do estado.
+    GetState {
+        reply: Reply<Snapshot>,
+    },
+    /// Substituição do perfil inteiro (importação, restauração de revisão, reset) e o tipo de edição para o histórico.
     SetProfile {
         profile: Box<Profile>,
         kind: EditKind,
@@ -88,6 +109,8 @@ pub struct Service<B: Backend> {
     retry: Option<(Instant, u32)>,
     status: Status,
     stopped: bool,
+    serial: u64,
+    notifier: Option<Box<dyn Fn(u64)>>,
 }
 
 /// Perfil ativo da configuração; sem nenhum, usa o primeiro existente ou cria o padrão. Nunca sobrescreve um perfil
@@ -135,7 +158,29 @@ impl<B: Backend> Service<B> {
             retry: None,
             status: Status::default(),
             stopped: false,
+            serial: 1,
+            notifier: None,
         })
+    }
+
+    /// Registra quem é avisado a cada mudança de estado visível (perfil ou status), com a nova versão.
+    pub fn set_notifier(&mut self, notifier: Box<dyn Fn(u64)>) {
+        self.notifier = Some(notifier);
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            serial: self.serial,
+            profile: self.profile.clone(),
+            status: self.status.clone(),
+        }
+    }
+
+    fn changed(&mut self) {
+        self.serial += 1;
+        if let Some(n) = &self.notifier {
+            n(self.serial);
+        }
     }
 
     pub fn profile(&self) -> &Profile {
@@ -165,6 +210,7 @@ impl<B: Backend> Service<B> {
                 self.status.connected = true;
                 self.status.reconnect_attempts = 0;
                 self.apply_current(now);
+                self.changed();
             }
             Err(e) => {
                 eprintln!("iara: sem conexão com o áudio ({e}); nova tentativa em breve");
@@ -189,6 +235,7 @@ impl<B: Backend> Service<B> {
             self.retry = Some((now + BACKOFF[0], 0));
             self.status.reconnect_attempts = 1;
         }
+        self.changed();
     }
 
     fn apply_current(&mut self, now: Instant) {
@@ -203,7 +250,10 @@ impl<B: Backend> Service<B> {
                 if !report.is_complete() {
                     eprintln!("iara: aplicação parcial, ausentes: {:?}", report.missing);
                 }
-                self.status.last_report = Some(report);
+                if self.status.last_report.as_ref() != Some(&report) {
+                    self.status.last_report = Some(report);
+                    self.changed();
+                }
             }
             Err(EngineError::Disconnected) => self.drop_backend(now),
             Err(e) => eprintln!("iara: falha ao aplicar o perfil: {e}"),
@@ -223,14 +273,24 @@ impl<B: Backend> Service<B> {
                     if self.status.persist_error.is_some() && self.tracker.next_deadline().is_none()
                     {
                         self.status.persist_error = None;
+                        self.changed();
                     }
                 }
                 Err(e) => {
                     eprintln!("iara: falha ao gravar: {e}");
                     self.status.persist_error = Some(e.to_string());
+                    self.changed();
                 }
             }
         }
+    }
+
+    fn replace_profile(&mut self, next: Profile, kind: EditKind, now: Instant) {
+        let previous = std::mem::replace(&mut self.profile, next);
+        self.changed();
+        self.apply_current(now);
+        let actions = self.tracker.on_edit(&previous, kind, now);
+        self.execute(actions);
     }
 
     pub fn handle(&mut self, msg: Msg, now: Instant) {
@@ -240,10 +300,28 @@ impl<B: Backend> Service<B> {
                     eprintln!("iara: perfil recusado: {e:?}");
                     return;
                 }
-                let previous = std::mem::replace(&mut self.profile, *profile);
-                self.apply_current(now);
-                let actions = self.tracker.on_edit(&previous, kind, now);
-                self.execute(actions);
+                self.replace_profile(*profile, kind, now);
+            }
+            Msg::Command(Command::Edit { cmd, reply }) => {
+                let result = match edit::apply(&self.profile, &cmd) {
+                    Ok((next, class)) => {
+                        let kind = match class {
+                            EditClass::Continuous => EditKind::Continuous,
+                            EditClass::Structural => {
+                                EditKind::Structural(RevisionReason::Structural)
+                            }
+                        };
+                        self.replace_profile(next, kind, now);
+                        Ok(self.serial)
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                if let Some(r) = reply {
+                    let _ = r.send(result);
+                }
+            }
+            Msg::Command(Command::GetState { reply }) => {
+                let _ = reply.send(self.snapshot());
             }
             Msg::Command(Command::Flush) => {
                 let actions = self.tracker.flush();
@@ -260,9 +338,13 @@ impl<B: Backend> Service<B> {
             Msg::Engine(Event::DeviceAbsent(d)) => {
                 if !self.status.absent_devices.contains(&d) {
                     self.status.absent_devices.push(d);
+                    self.changed();
                 }
             }
-            Msg::Engine(Event::DeviceBack(d)) => self.status.absent_devices.retain(|x| *x != d),
+            Msg::Engine(Event::DeviceBack(d)) => {
+                self.status.absent_devices.retain(|x| *x != d);
+                self.changed();
+            }
         }
     }
 
@@ -574,5 +656,98 @@ mod tests {
         assert_eq!(svc.status().absent_devices, ["fone"]);
         svc.handle(Msg::Engine(Event::DeviceBack("fone".into())), t0);
         assert!(svc.status().absent_devices.is_empty());
+    }
+
+    fn edit(cmd: EditCommand) -> (Msg, mpsc::Receiver<Result<u64, String>>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            Msg::Command(Command::Edit {
+                cmd,
+                reply: Some(tx),
+            }),
+            rx,
+        )
+    }
+
+    #[test]
+    fn edit_commands_change_the_profile_apply_to_the_backend_and_report_the_new_serial() {
+        use iara_core::edit::SendKind;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        let before = svc.snapshot().serial;
+        let (msg, rx) = edit(EditCommand::SetChannelGain {
+            channel: "game".into(),
+            send: SendKind::Personal,
+            gain: Gain::from_db(-6.0).unwrap(),
+        });
+        svc.handle(msg, t0);
+        let serial = rx.try_recv().unwrap().unwrap();
+        assert!(serial > before);
+        assert_eq!(svc.snapshot().serial, serial);
+        assert_eq!(svc.profile().channels[0].personal.gain.db(), Some(-6.0));
+        assert_eq!(world.applied.borrow().len(), 2, "aplicado ao backend");
+        // estrutural: revisão própria imediata, via o mesmo caminho
+        let (msg, rx) = edit(EditCommand::AddChannel {
+            id: "musica".into(),
+            name: "Música".into(),
+        });
+        svc.handle(msg, t0);
+        assert!(rx.try_recv().unwrap().is_ok());
+        let store = Store::open(dir.path().join("config"), dir.path().join("state"));
+        assert!(store
+            .list_revisions("default")
+            .unwrap()
+            .iter()
+            .any(|r| r.reason == RevisionReason::Structural));
+    }
+
+    #[test]
+    fn a_rejected_edit_replies_with_the_error_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        let snap = svc.snapshot();
+        let (msg, rx) = edit(EditCommand::SetChatMixPosition(9.0));
+        svc.handle(msg, t0);
+        assert!(rx.try_recv().unwrap().unwrap_err().contains("ChatMix"));
+        let (msg, rx) = edit(EditCommand::RemoveChannel {
+            channel: "fantasma".into(),
+        });
+        svc.handle(msg, t0);
+        assert!(rx.try_recv().unwrap().unwrap_err().contains("fantasma"));
+        assert_eq!(svc.snapshot(), snap, "perfil, status e versão intactos");
+        assert_eq!(world.applied.borrow().len(), 1);
+        assert!(svc.next_deadline().is_none(), "nem autosave foi agendado");
+    }
+
+    #[test]
+    fn get_state_returns_the_snapshot_and_the_notifier_sees_every_visible_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, _) = service(&dir);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let log = seen.clone();
+        svc.set_notifier(Box::new(move |n| log.borrow_mut().push(n)));
+        let t0 = Instant::now();
+        svc.start(t0); // conecta: status muda
+        let (tx, rx) = mpsc::channel();
+        svc.handle(Msg::Command(Command::GetState { reply: tx }), t0);
+        let snap = rx.try_recv().unwrap();
+        assert!(snap.status.connected);
+        assert_eq!(snap.serial, svc.snapshot().serial);
+
+        svc.handle(Msg::Engine(Event::DeviceAbsent("fone".into())), t0);
+        let (msg, _rx) = edit(EditCommand::SetMicGlobalMute(true));
+        svc.handle(msg, t0);
+        svc.handle(Msg::Engine(Event::Disconnected), t0 + s(1));
+        let seen = seen.borrow();
+        assert!(seen.len() >= 4);
+        assert!(
+            seen.windows(2).all(|w| w[0] < w[1]),
+            "versões estritamente crescentes: {seen:?}"
+        );
+        assert_eq!(*seen.last().unwrap(), svc.snapshot().serial);
     }
 }
