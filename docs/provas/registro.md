@@ -196,6 +196,32 @@ menor/maior) ou com Bluetooth.
   depois da remoção (pico 123,5 MiB): sem vazamento observado.
 - Sem metas numéricas definidas; estes são os números de partida para a spec 10.
 
+## Prova 07 — motor real (`iara-audio`) de ponta a ponta, e defeito do PipeWire com `Audio/Source/Virtual`
+
+Script: `tools/provas/07-motor-e2e.sh` (exemplo `mixer_cli`, perfil inicial). 42 nós `iara.*` (12 nós, 13 ramos × 2, 2 fontes × 2); 15
+reaplicações sem duplicar; 0 nós após encerrar o motor. Resultados nos cenários da spec 12 (dBFS RMS, seno 0,5):
+
+| Cenário | MASTER pessoal | MASTER transmissão | Fonte Transmissão | Fonte Microfone |
+| --- | --- | --- | --- | --- |
+| GAME (base) | −9,27 | −9,23 | −9,23 | −∞ |
+| GAME escuta −6 dB | −15,23 | −9,23 | — | — |
+| MEDIA fora da transmissão | −9,18 | −∞ | — | — |
+| Não atribuídos | −9,04 | −∞ | — | — |
+| MASTER transmissão −6 dB (GAME) | −9,23 | −15,18 | −15,27 | −∞ |
+| ChatMix +1: GAME / CHAT | −∞ / −9,08 | −9,23 / −9,08 | — | — |
+| MIC (base) | −∞ | −9,08 | −9,08 | −9,08 |
+| MIC mute global | −∞ | −∞ | −∞ | −∞ |
+| MASTER pessoal −20 dB (MIC) | −∞ | −9,13 | −9,04 | −9,08 (intocado) |
+
+Fontes lidas por um cliente de captura (`pw-record --target`, sem o recurso de monitor) como o OBS/Discord leem. O OBS do usuário roda no host,
+fora do distrobox, mas usa o mesmo daemon; a seleção dentro do OBS não foi testada.
+
+**Defeito do PipeWire 1.6.9 (reproduzido no distrobox e no host Bazzite):** qualquer `pw-loopback` com `media.class=Audio/Source/Virtual` no lado de
+reprodução termina com SIGSEGV (código 139) — inclusive o padrão canônico (sink + source virtual) e sem nenhum nó do Iara. O log (`PIPEWIRE_DEBUG=4`) mostra
+`impl-node.c:1893 node_port_info(): can't add port …: -28` (ENOSPC) imediatamente antes da queda; gdb: SIGSEGV em libpipewire, chamado por
+`libspa-audioconvert` a partir de `module-client-node`. Com `media.class=Audio/Source` (sem `Virtual`) o mesmo loopback funciona e aparece como fonte. Decisão: as fontes
+do Iara usam `Audio/Source`. Sentinela: `tools/provas/08-bug-source-virtual.sh`. Defeito não reportado a montante.
+
 ### O que isto NÃO prova
 
 - Medições longas (horas), CPU com medidores de nível ativos e com efeitos; o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.

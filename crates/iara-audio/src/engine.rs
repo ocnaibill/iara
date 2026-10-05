@@ -1,4 +1,4 @@
-use iara_core::topology::{diff, BranchSpec, NodeSpec, Plan, NODE_PREFIX};
+use iara_core::topology::{diff, BranchSpec, NodeSpec, Plan, SourceSpec, NODE_PREFIX};
 use pipewire as pw;
 use pw::spa::param::ParamType;
 use pw::spa::pod::{serialize::PodSerializer, Object, Pod, Property, Value, ValueArray};
@@ -181,7 +181,7 @@ fn node_props(spec: &NodeSpec) -> pw::properties::PropertiesBox {
     pw::properties::properties! {
         "factory.name" => "support.null-audio-sink",
         "node.name" => spec.name.as_str(),
-        "node.description" => format!("Iara {}", spec.name.trim_start_matches(NODE_PREFIX)),
+        "node.description" => spec.description.as_str(),
         "media.class" => "Audio/Sink",
         "audio.position" => "[FL FR]",
         "priority.session" => "0",
@@ -204,6 +204,39 @@ fn loopback_args(b: &BranchSpec) -> String {
         to = b.to,
         c = COMMON_PROPS,
     )
+}
+
+/// Fonte virtual selecionável por outros aplicativos: o lado de captura lê o monitor de `from`; o lado de reprodução
+/// aparece como `Audio/Source` (não `Audio/Source/Virtual`: PipeWire 1.6.9 falha com ela, ver docs/provas/registro.md). Prioridade de sessão 0 para nunca virar fonte padrão por conta própria.
+fn source_args(src: &SourceSpec) -> String {
+    format!(
+        "{{ audio.position=[FL FR] \
+         capture.props={{ node.name=\"{cap}\" target.object=\"{from}\" stream.capture.sink=true node.passive=true node.dont-fallback=true {c} }} \
+         playback.props={{ node.name=\"{name}\" node.description=\"{desc}\" media.class=Audio/Source priority.session=0 {c} }} }}",
+        cap = source_capture_name(&src.name),
+        from = src.from,
+        name = src.name,
+        desc = src.description,
+        c = COMMON_PROPS,
+    )
+}
+
+fn source_capture_name(source: &str) -> String {
+    format!("{source}.cap")
+}
+
+fn load_module(context: &pw::context::ContextRc, args: &str) -> Option<ModuleHandle> {
+    let args = CString::new(args).expect("sem NUL");
+    // SAFETY: contexto vivo nesta thread; args é string C válida durante a chamada.
+    let m = unsafe {
+        pw::sys::pw_context_load_module(
+            context.as_raw_ptr(),
+            c"libpipewire-module-loopback".as_ptr(),
+            args.as_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    (!m.is_null()).then_some(ModuleHandle(m))
 }
 
 fn check_pending(state: &Rc<RefCell<State>>, force: bool) {
@@ -348,6 +381,7 @@ fn apply(
     let empty = Plan {
         nodes: vec![],
         branches: vec![],
+        sources: vec![],
     };
     let current = state.borrow().applied.clone().unwrap_or(empty);
     let d = diff(&current, &plan);
@@ -358,12 +392,17 @@ fn apply(
     let add_nodes: Vec<NodeSpec> = d.add_nodes.iter().map(|n| (*n).clone()).collect();
     let add_branches: Vec<BranchSpec> = d.add_branches.iter().map(|b| (*b).clone()).collect();
     let retune: Vec<BranchSpec> = d.retune.iter().map(|b| (*b).clone()).collect();
+    let rm_sources: Vec<String> = d.remove_sources.iter().map(|x| x.name.clone()).collect();
+    let add_sources: Vec<SourceSpec> = d.add_sources.iter().map(|x| (*x).clone()).collect();
 
     let mut st = state.borrow_mut();
     // 1) remove ramos antes dos nós que eles ligam
     for name in &rm_branches {
         st.modules.remove(name); // Drop destrói o módulo
         st.levels.remove(&out_name(name));
+    }
+    for name in &rm_sources {
+        st.modules.remove(name);
     }
     for name in &rm_nodes {
         if let Some(node) = st.owned_nodes.remove(name) {
@@ -382,20 +421,19 @@ fn apply(
     for b in &add_branches {
         st.levels
             .insert(out_name(&b.name), (b.volume as f32, b.muted));
-        let args = CString::new(loopback_args(b)).expect("sem NUL");
-        // SAFETY: contexto vivo nesta thread; args é string C válida durante a chamada.
-        let m = unsafe {
-            pw::sys::pw_context_load_module(
-                context.as_raw_ptr(),
-                c"libpipewire-module-loopback".as_ptr(),
-                args.as_ptr(),
-                std::ptr::null_mut(),
-            )
-        };
-        if m.is_null() {
-            eprintln!("iara-audio: falha ao carregar o ramo {}", b.name);
-        } else {
-            st.modules.insert(b.name.clone(), ModuleHandle(m));
+        match load_module(context, &loopback_args(b)) {
+            Some(m) => {
+                st.modules.insert(b.name.clone(), m);
+            }
+            None => eprintln!("iara-audio: falha ao carregar o ramo {}", b.name),
+        }
+    }
+    for src in &add_sources {
+        match load_module(context, &source_args(src)) {
+            Some(m) => {
+                st.modules.insert(src.name.clone(), m);
+            }
+            None => eprintln!("iara-audio: falha ao carregar a fonte {}", src.name),
         }
     }
     // 3) só ganho/mute
@@ -410,6 +448,10 @@ fn apply(
     for b in &plan.branches {
         expected.push(in_name(&b.name));
         expected.push(out_name(&b.name));
+    }
+    for src in &plan.sources {
+        expected.push(source_capture_name(&src.name));
+        expected.push(src.name.clone());
     }
     st.applied = Some(plan);
     st.pending = Some(Pending {

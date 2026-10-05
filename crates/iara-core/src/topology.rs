@@ -17,6 +17,9 @@ pub const MASTER_TRANSMISSION: &str = "iara.master.transmission";
 pub const MIC_INPUT: &str = "iara.mic.input";
 pub const MIC_COMMON: &str = "iara.mic.common";
 pub const MIC_APPS: &str = "iara.mic.apps";
+/// Fontes virtuais selecionáveis por outros aplicativos (OBS, Discord): o MIC dedicado e a transmissão.
+pub const SOURCE_MIC: &str = "iara.src.mic";
+pub const SOURCE_TRANSMISSION: &str = "iara.src.transmission";
 
 pub fn channel_node(id: &str) -> String {
     format!("{NODE_PREFIX}ch.{id}")
@@ -37,6 +40,16 @@ pub enum NodeRole {
 pub struct NodeSpec {
     pub name: String,
     pub role: NodeRole,
+    /// Nome apresentado ao usuário (seletores de dispositivo dos aplicativos).
+    pub description: String,
+}
+
+/// Fonte virtual (`Audio/Source`) alimentada pelo monitor do nó `from`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceSpec {
+    pub name: String,
+    pub from: String,
+    pub description: String,
 }
 
 /// Ramo: copia o sinal de `from` para `to` com `volume` (amplitude linear) e `muted`.
@@ -53,6 +66,7 @@ pub struct BranchSpec {
 pub struct Plan {
     pub nodes: Vec<NodeSpec>,
     pub branches: Vec<BranchSpec>,
+    pub sources: Vec<SourceSpec>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -93,22 +107,59 @@ pub fn plan(profile: &Profile) -> Result<Plan, PlanError> {
         mix_factor.insert(second.as_str(), b);
     }
 
-    let node = |name: &str, role| NodeSpec {
+    let node = |name: &str, role, description: String| NodeSpec {
         name: name.to_owned(),
         role,
+        description,
     };
     let mut nodes = Vec::new();
     for c in &profile.channels {
-        nodes.push(node(&channel_node(&c.id), NodeRole::Channel));
+        nodes.push(node(
+            &channel_node(&c.id),
+            NodeRole::Channel,
+            format!("Iara — {}", c.name),
+        ));
     }
-    nodes.push(node(UNASSIGNED, NodeRole::Unassigned));
-    nodes.push(node(MIX_PERSONAL, NodeRole::Mix));
-    nodes.push(node(MIX_TRANSMISSION, NodeRole::Mix));
-    nodes.push(node(MASTER_PERSONAL, NodeRole::Master));
-    nodes.push(node(MASTER_TRANSMISSION, NodeRole::Master));
-    nodes.push(node(MIC_INPUT, NodeRole::MicInput));
-    nodes.push(node(MIC_COMMON, NodeRole::MicCommon));
-    nodes.push(node(MIC_APPS, NodeRole::MicApps));
+    nodes.push(node(
+        UNASSIGNED,
+        NodeRole::Unassigned,
+        "Iara — Saída principal".into(),
+    ));
+    nodes.push(node(
+        MIX_PERSONAL,
+        NodeRole::Mix,
+        "Iara (interno) — Mix pessoal".into(),
+    ));
+    nodes.push(node(
+        MIX_TRANSMISSION,
+        NodeRole::Mix,
+        "Iara (interno) — Mix de transmissão".into(),
+    ));
+    nodes.push(node(
+        MASTER_PERSONAL,
+        NodeRole::Master,
+        "Iara (interno) — MASTER pessoal".into(),
+    ));
+    nodes.push(node(
+        MASTER_TRANSMISSION,
+        NodeRole::Master,
+        "Iara (interno) — MASTER transmissão".into(),
+    ));
+    nodes.push(node(
+        MIC_INPUT,
+        NodeRole::MicInput,
+        "Iara (interno) — Entrada do microfone".into(),
+    ));
+    nodes.push(node(
+        MIC_COMMON,
+        NodeRole::MicCommon,
+        "Iara (interno) — Microfone comum".into(),
+    ));
+    nodes.push(node(
+        MIC_APPS,
+        NodeRole::MicApps,
+        "Iara (interno) — Microfone para aplicativos".into(),
+    ));
 
     let mut branches = Vec::new();
     for c in &profile.channels {
@@ -169,7 +220,23 @@ pub fn plan(profile: &Profile) -> Result<Plan, PlanError> {
             branches.push(branch(MIC_COMMON, to, send.gain.amplitude(), send.muted));
         }
     }
-    Ok(Plan { nodes, branches })
+    let sources = vec![
+        SourceSpec {
+            name: SOURCE_MIC.into(),
+            from: MIC_APPS.into(),
+            description: "Iara — Microfone".into(),
+        },
+        SourceSpec {
+            name: SOURCE_TRANSMISSION.into(),
+            from: MASTER_TRANSMISSION.into(),
+            description: "Iara — Transmissão".into(),
+        },
+    ];
+    Ok(Plan {
+        nodes,
+        branches,
+        sources,
+    })
 }
 
 /// Diferença entre o plano aplicado e o desejado. `retune` só muda volume/mute (via Props); ramos com
@@ -181,6 +248,8 @@ pub struct PlanDiff<'a> {
     pub add_branches: Vec<&'a BranchSpec>,
     pub remove_branches: Vec<&'a BranchSpec>,
     pub retune: Vec<&'a BranchSpec>,
+    pub add_sources: Vec<&'a SourceSpec>,
+    pub remove_sources: Vec<&'a SourceSpec>,
 }
 
 impl PlanDiff<'_> {
@@ -190,6 +259,8 @@ impl PlanDiff<'_> {
             && self.add_branches.is_empty()
             && self.remove_branches.is_empty()
             && self.retune.is_empty()
+            && self.add_sources.is_empty()
+            && self.remove_sources.is_empty()
     }
 }
 
@@ -222,6 +293,21 @@ pub fn diff<'a>(current: &'a Plan, desired: &'a Plan) -> PlanDiff<'a> {
             d.remove_branches.push(c);
         }
     }
+    for src in &desired.sources {
+        match current.sources.iter().find(|c| c.name == src.name) {
+            None => d.add_sources.push(src),
+            Some(c) if c != src => {
+                d.remove_sources.push(c);
+                d.add_sources.push(src);
+            }
+            Some(_) => {}
+        }
+    }
+    for c in &current.sources {
+        if !desired.sources.iter().any(|s| s.name == c.name) {
+            d.remove_sources.push(c);
+        }
+    }
     d
 }
 
@@ -239,6 +325,7 @@ mod tests {
         let p = plan(&initial_profile()).unwrap();
         assert_eq!(p.nodes.len(), 12);
         assert_eq!(p.branches.len(), 13);
+        assert_eq!(p.sources.len(), 2);
         // AUX fora da transmissão; Não atribuídos só na escuta; MIC pessoal desabilitado por padrão.
         assert!(find(&p, &channel_node("aux"), MIX_TRANSMISSION).is_none());
         assert!(find(&p, &channel_node("aux"), MIX_PERSONAL).is_some());
@@ -313,6 +400,33 @@ mod tests {
         assert!(b.muted && (b.volume - 0.1).abs() < 1e-12);
         // os ramos de saída não repetem o ganho comum (evita contar duas vezes)
         assert_eq!(find(&p, MIC_COMMON, MIC_APPS).unwrap().volume, 1.0);
+    }
+
+    #[test]
+    fn exposed_sources_read_the_right_buses_and_have_readable_names() {
+        let p = plan(&initial_profile()).unwrap();
+        let mic = p.sources.iter().find(|s| s.name == SOURCE_MIC).unwrap();
+        // O microfone dedicado vem de MIC_APPS (fora do MASTER); a transmissão vem depois do MASTER de transmissão.
+        assert_eq!(
+            (mic.from.as_str(), mic.description.as_str()),
+            (MIC_APPS, "Iara — Microfone")
+        );
+        let tx = p
+            .sources
+            .iter()
+            .find(|s| s.name == SOURCE_TRANSMISSION)
+            .unwrap();
+        assert_eq!(tx.from, MASTER_TRANSMISSION);
+        // Nome legível do canal vem do nome do perfil, não do id.
+        let mut profile = initial_profile();
+        profile.channels[0].name = "Jogos".into();
+        let p = plan(&profile).unwrap();
+        let node = p
+            .nodes
+            .iter()
+            .find(|n| n.name == channel_node("game"))
+            .unwrap();
+        assert_eq!(node.description, "Iara — Jogos");
     }
 
     #[test]

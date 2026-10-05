@@ -171,6 +171,10 @@ Confirmado: os objetos de áudio do Iara (sinks, loopbacks/streams, fontes virtu
 
 Medido (prova 05b): um loopback com `node.dont-fallback` é descarregado quando o dispositivo some e não volta sozinho; sem a propriedade, o WirePlumber move o fluxo para outro dispositivo (microfone da webcam, caixas) e depois o devolve. Decisão de projeto: o serviço é dono do ciclo dos streams que tocam em dispositivos físicos. Os nós virtuais (mixes, fonte do MIC) permanecem e fornecem silêncio; os streams para o dispositivo físico são criados com `node.dont-fallback`, removidos na ausência e recriados quando o dispositivo preferido volta, respeitando a geração da escolha (8.5/8.6). Nenhum fluxo do Iara deve usar fallback automático do WirePlumber para dispositivo não autorizado.
 
+#### 6.3.1.4 Fontes virtuais expostas
+
+As entradas selecionáveis por outros aplicativos são “Iara — Microfone” (fonte dedicada do MIC, depois do ganho/mute do MIC e fora do MASTER) e “Iara — Transmissão” (soma de transmissão depois do MASTER de transmissão). São nós `Audio/Source` alimentados pelo monitor de um barramento interno. Medido: `Audio/Source/Virtual` derruba o cliente no PipeWire 1.6.9 (prova 07); por isso não é usada. A saída principal apresentada ao usuário é “Iara — Saída principal”, e cada canal aparece como “Iara — NOME”; barramentos internos têm o prefixo “Iara (interno)”. Pendente: tornar a saída principal o destino padrão, registrando o anterior (8.2), e verificar a seleção no OBS e no Discord.
+
 #### 6.3.2 Prova mínima e critérios de saída
 
 1. Numa sessão Linux real com PipeWire/WirePlumber, criar um canal e dois destinos capturáveis independentes. Gerar sinal conhecido e registrar rate/quantum/formato.
@@ -458,3 +462,4 @@ Consultadas em 05/10/2026. Fundamentam capacidades existentes; os comportamentos
 - **0.10 — 05/10/2026:** provas 01–03 executadas e registradas; opt-out da restauração de estado do WirePlumber para nós do Iara; restauração do WirePlumber tratada como aplicativo novo (regra aplicada uma vez, depois respeita mudanças externas).
 - **0.10.1 — 05/10/2026:** hospedagem decidida: tudo no processo do serviço; fechar a janela mantém o serviço; desligar o serviço é decisão consciente do usuário (6.3.1.2).
 - **0.10.2 — 05/10/2026:** provas 04–05 registradas; ciclo de vida dos streams de dispositivos físicos fica sob controle do serviço (6.3.1.3).
+- **0.10.3 — 05/10/2026:** motor `iara-audio` validado ponta a ponta; fontes virtuais como `Audio/Source` (defeito do PipeWire 1.6.9 com `Audio/Source/Virtual`, 6.3.1.4).
