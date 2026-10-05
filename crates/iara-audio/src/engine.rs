@@ -1,12 +1,14 @@
-use iara_core::topology::{diff, BranchSpec, NodeSpec, Plan, SourceSpec, NODE_PREFIX};
+use iara_core::topology::{
+    diff, BranchSpec, DeviceDirection, DeviceLink, NodeSpec, Plan, SourceSpec, NODE_PREFIX,
+};
 use pipewire as pw;
 use pw::spa::param::ParamType;
 use pw::spa::pod::{serialize::PodSerializer, Object, Pod, Property, Value, ValueArray};
 use pw::spa::sys::{SPA_PROP_channelVolumes, SPA_PROP_mute, SPA_TYPE_OBJECT_Props};
 use pw::types::ObjectType;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{c_void, CString};
 use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -15,6 +17,8 @@ use std::time::{Duration, Instant};
 
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(100);
+/// Espera mínima entre tentativas de religar um dispositivo (evita laço se o módulo se descarregar de novo).
+const DEVICE_RETRY: Duration = Duration::from_secs(2);
 /// Opt-out da restauração de volume/mute/destino do WirePlumber (prova 03) e marca de propriedade do Iara.
 const COMMON_PROPS: &str = "state.restore-props=false state.restore-target=false iara.managed=true";
 
@@ -40,6 +44,10 @@ impl std::error::Error for EngineError {}
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
     Disconnected,
+    /// O dispositivo físico preferido (chave persistente) não está no sistema; a ligação foi removida, sem fallback.
+    DeviceAbsent(String),
+    /// O dispositivo preferido voltou; a ligação foi recriada.
+    DeviceBack(String),
 }
 
 /// Resultado de uma aplicação. `missing` lista os nós esperados que não apareceram no registro dentro do prazo;
@@ -48,6 +56,8 @@ pub enum Event {
 pub struct ApplyReport {
     pub observed: usize,
     pub missing: Vec<String>,
+    /// Dispositivos físicos desejados que não estão presentes (não contam como `missing`).
+    pub absent_devices: Vec<String>,
 }
 
 impl ApplyReport {
@@ -115,12 +125,58 @@ impl Drop for Engine {
     }
 }
 
-struct ModuleHandle(*mut pw::sys::pw_impl_module);
+/// Módulo carregado no nosso contexto. O módulo loopback se descarrega sozinho quando o alvo some (prova 05b), então
+/// o ponteiro pode ficar inválido sem aviso: um listener do evento `destroy` mantém `alive` e evita destruí-lo duas vezes.
+struct ModuleHandle {
+    module: *mut pw::sys::pw_impl_module,
+    alive: *const Cell<bool>,
+    _hook: Box<pw::spa::sys::spa_hook>,
+    _events: Box<pw::sys::pw_impl_module_events>,
+}
+
+unsafe extern "C" fn on_module_destroy(data: *mut c_void) {
+    // SAFETY: `data` é o ponteiro de `alive`, válido enquanto o ModuleHandle existir.
+    unsafe { (*(data as *const Cell<bool>)).set(false) };
+}
+
+impl ModuleHandle {
+    fn new(module: *mut pw::sys::pw_impl_module) -> Self {
+        let alive = Rc::into_raw(Rc::new(Cell::new(true)));
+        // SAFETY: spa_hook é POD inicializável com zeros; os dois Box mantêm endereço estável até o Drop.
+        let mut hook: Box<pw::spa::sys::spa_hook> = Box::new(unsafe { std::mem::zeroed() });
+        let events = Box::new(pw::sys::pw_impl_module_events {
+            version: 0,
+            destroy: Some(on_module_destroy),
+            free: None,
+            initialized: None,
+            registered: None,
+        });
+        // SAFETY: módulo recém-carregado e vivo; hook/events/alive sobrevivem ao módulo (liberados só no Drop).
+        unsafe {
+            pw::sys::pw_impl_module_add_listener(module, &mut *hook, &*events, alive as *mut c_void)
+        };
+        Self {
+            module,
+            alive,
+            _hook: hook,
+            _events: events,
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        // SAFETY: `alive` vem de Rc::into_raw e só é liberado no Drop.
+        unsafe { (*self.alive).get() }
+    }
+}
 
 impl Drop for ModuleHandle {
     fn drop(&mut self) {
-        // SAFETY: ponteiro devolvido por pw_context_load_module e destruído uma única vez, na thread do loop.
-        unsafe { pw::sys::pw_impl_module_destroy(self.0) };
+        if self.is_alive() {
+            // SAFETY: módulo ainda vivo, destruído uma única vez, na thread do loop; o evento destroy zera `alive`.
+            unsafe { pw::sys::pw_impl_module_destroy(self.module) };
+        }
+        // SAFETY: devolve a contagem criada em `new`.
+        unsafe { drop(Rc::from_raw(self.alive)) };
     }
 }
 
@@ -140,6 +196,13 @@ struct State {
     /// Nível desejado por nó de saída de ramo: (volume linear, mute). Reaplicado sempre que o nó aparece.
     levels: HashMap<String, (f32, bool)>,
     pending: Option<Pending>,
+    /// Ligações desejadas com dispositivos físicos e os módulos que as realizam (nome da ligação → (físico, módulo)).
+    devices: Vec<DeviceLink>,
+    device_modules: HashMap<String, (String, ModuleHandle)>,
+    device_present: HashMap<String, bool>,
+    retry_after: HashMap<String, Instant>,
+    /// Todos os nós do registro (id → node.name); base para saber se um dispositivo físico está presente.
+    nodes_present: HashMap<u32, String>,
 }
 
 fn props_pod(prop: u32, value: Value) -> Vec<u8> {
@@ -192,18 +255,28 @@ fn node_props(spec: &NodeSpec) -> pw::properties::PropertiesBox {
     }
 }
 
-fn loopback_args(b: &BranchSpec) -> String {
+/// Loopback entre dois nós. `from_is_sink`: lê o monitor de um sink (barramentos do Iara, saída) em vez de uma fonte.
+/// Sempre `node.dont-fallback`: o WirePlumber nunca troca o alvo por outro dispositivo (spec 8.5/8.6).
+fn link_args(name: &str, from: &str, from_is_sink: bool, to: &str) -> String {
     format!(
         "{{ audio.position=[FL FR] node.name=\"{name}\" \
-         capture.props={{ node.name=\"{inn}\" target.object=\"{from}\" stream.capture.sink=true node.passive=true node.dont-fallback=true {c} }} \
+         capture.props={{ node.name=\"{inn}\" target.object=\"{from}\" stream.capture.sink={from_is_sink} node.passive=true node.dont-fallback=true {c} }} \
          playback.props={{ node.name=\"{out}\" target.object=\"{to}\" node.dont-fallback=true {c} }} }}",
-        name = b.name,
-        inn = in_name(&b.name),
-        out = out_name(&b.name),
-        from = b.from,
-        to = b.to,
+        inn = in_name(name),
+        out = out_name(name),
         c = COMMON_PROPS,
     )
+}
+
+fn loopback_args(b: &BranchSpec) -> String {
+    link_args(&b.name, &b.from, true, &b.to)
+}
+
+fn device_args(d: &DeviceLink) -> String {
+    match d.direction {
+        DeviceDirection::Output => link_args(&d.name, &d.bus, true, &d.physical),
+        DeviceDirection::Input => link_args(&d.name, &d.physical, false, &d.bus),
+    }
 }
 
 /// Fonte virtual selecionável por outros aplicativos: o lado de captura lê o monitor de `from`; o lado de reprodução
@@ -236,22 +309,88 @@ fn load_module(context: &pw::context::ContextRc, args: &str) -> Option<ModuleHan
             std::ptr::null_mut(),
         )
     };
-    (!m.is_null()).then_some(ModuleHandle(m))
+    (!m.is_null()).then(|| ModuleHandle::new(m))
+}
+
+fn device_present(st: &State, d: &DeviceLink) -> bool {
+    st.nodes_present.values().any(|n| *n == d.physical)
+}
+
+/// Cria/remove as ligações com dispositivos físicos conforme a presença no registro. Nunca recria com outro
+/// dispositivo: o plano é a única fonte do dispositivo preferido (a escolha do usuário durante a ausência é um novo plano).
+fn reconcile_devices(st: &mut State, context: &pw::context::ContextRc, ev: &mpsc::Sender<Event>) {
+    let desired = st.devices.clone();
+    let stale: Vec<String> = st
+        .device_modules
+        .iter()
+        .filter(|(name, (physical, handle))| {
+            desired.iter().find(|d| &d.name == *name).is_none_or(|d| {
+                d.physical != *physical || !handle.is_alive() || !device_present(st, d)
+            })
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in stale {
+        st.device_modules.remove(&name);
+    }
+    for d in &desired {
+        let present = device_present(st, d);
+        match (st.device_present.insert(d.name.clone(), present), present) {
+            (None | Some(true), false) => {
+                let _ = ev.send(Event::DeviceAbsent(d.physical.clone()));
+            }
+            (Some(false), true) => {
+                let _ = ev.send(Event::DeviceBack(d.physical.clone()));
+            }
+            _ => {}
+        }
+        let ready = st
+            .retry_after
+            .get(&d.name)
+            .is_none_or(|t| Instant::now() >= *t);
+        if present && ready && !st.device_modules.contains_key(&d.name) {
+            st.retry_after
+                .insert(d.name.clone(), Instant::now() + DEVICE_RETRY);
+            match load_module(context, &device_args(d)) {
+                Some(m) => {
+                    st.device_modules
+                        .insert(d.name.clone(), (d.physical.clone(), m));
+                }
+                None => eprintln!("iara-audio: falha ao ligar o dispositivo {}", d.physical),
+            }
+        }
+    }
+    st.device_present
+        .retain(|name, _| desired.iter().any(|d| &d.name == name));
 }
 
 fn check_pending(state: &Rc<RefCell<State>>, force: bool) {
     let mut st = state.borrow_mut();
     let Some(p) = st.pending.as_ref() else { return };
-    let missing: Vec<String> = p
-        .expected
+    let mut expected = p.expected.clone();
+    for name in st.device_modules.keys() {
+        expected.push(in_name(name));
+        expected.push(out_name(name));
+    }
+    let missing: Vec<String> = expected
         .iter()
         .filter(|n| !st.seen.contains_key(*n))
         .cloned()
         .collect();
     if missing.is_empty() || force || Instant::now() >= p.deadline {
+        let absent_devices = st
+            .devices
+            .iter()
+            .filter(|d| !device_present(&st, d))
+            .map(|d| d.physical.clone())
+            .collect();
         let p = st.pending.take().expect("pending presente");
-        let observed = p.expected.len() - missing.len();
-        let _ = p.reply.send(Ok(ApplyReport { observed, missing }));
+        let observed = expected.len() - missing.len();
+        let _ = p.reply.send(Ok(ApplyReport {
+            observed,
+            missing,
+            absent_devices,
+        }));
     }
 }
 
@@ -309,6 +448,11 @@ fn run(
                 let Some(name) = g.props.and_then(|p| p.get("node.name")) else {
                     return;
                 };
+                // Presença de qualquer nó (inclusive dispositivos físicos) alimenta o reconciliador de dispositivos.
+                st_add
+                    .borrow_mut()
+                    .nodes_present
+                    .insert(g.id, name.to_owned());
                 if !name.starts_with(NODE_PREFIX) {
                     return;
                 }
@@ -325,16 +469,21 @@ fn run(
                 }
             })
             .global_remove(move |id| {
-                st_rm.borrow_mut().seen.retain(|_, (gid, _)| *gid != id);
+                let mut st = st_rm.borrow_mut();
+                st.seen.retain(|_, (gid, _)| *gid != id);
+                st.nodes_present.remove(&id);
             })
             .register()
     };
 
     let timer = {
         let st = state.clone();
-        mainloop
-            .loop_()
-            .add_timer(move |_| check_pending(&st, false))
+        let ctx = context.clone();
+        let ev = ev_tx.clone();
+        mainloop.loop_().add_timer(move |_| {
+            reconcile_devices(&mut st.borrow_mut(), &ctx, &ev);
+            check_pending(&st, false);
+        })
     };
     let _ = timer.update_timer(Some(TICK), Some(TICK));
 
@@ -343,9 +492,10 @@ fn run(
         let st = state.clone();
         let core = core.clone();
         let ctx = context.clone();
+        let ev = ev_tx.clone();
         rx.attach(mainloop.loop_(), move |cmd| match cmd {
             Command::Shutdown => ml.quit(),
-            Command::Apply(plan, reply) => apply(&st, &core, &ctx, *plan, reply),
+            Command::Apply(plan, reply) => apply(&st, &core, &ctx, &ev, *plan, reply),
         })
     };
 
@@ -357,6 +507,7 @@ fn run(
         if let Some(p) = st.pending.take() {
             let _ = p.reply.send(Err(EngineError::Disconnected));
         }
+        st.device_modules.clear();
         st.modules.clear();
         st.owned_nodes.clear();
         st.seen.clear();
@@ -369,6 +520,7 @@ fn apply(
     state: &Rc<RefCell<State>>,
     core: &pw::core::CoreRc,
     context: &pw::context::ContextRc,
+    ev: &mpsc::Sender<Event>,
     plan: Plan,
     reply: Reply,
 ) {
@@ -382,6 +534,7 @@ fn apply(
         nodes: vec![],
         branches: vec![],
         sources: vec![],
+        devices: vec![],
     };
     let current = state.borrow().applied.clone().unwrap_or(empty);
     let d = diff(&current, &plan);
@@ -453,6 +606,8 @@ fn apply(
         expected.push(source_capture_name(&src.name));
         expected.push(src.name.clone());
     }
+    st.devices = plan.devices.clone();
+    reconcile_devices(&mut st, context, ev);
     st.applied = Some(plan);
     st.pending = Some(Pending {
         expected,

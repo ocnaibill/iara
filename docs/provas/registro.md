@@ -222,6 +222,27 @@ reprodução termina com SIGSEGV (código 139) — inclusive o padrão canônico
 `libspa-audioconvert` a partir de `module-client-node`. Com `media.class=Audio/Source` (sem `Virtual`) o mesmo loopback funciona e aparece como fonte. Decisão: as fontes
 do Iara usam `Audio/Source`. Sentinela: `tools/provas/08-bug-source-virtual.sh`. Defeito não reportado a montante.
 
+## Prova 09 — dispositivos físicos no motor real (implementa a spec 6.3.1.3)
+
+Scripts: `tools/provas/09-dispositivos-e2e.sh` (HDMI como saída e placa de captura ezcap como entrada, que não têm outros usuários) e
+`10-dispositivos-reais.sh` (fone na saída analógica da placa-mãe e microfone USB do desenvolvedor, só conferência de ligações).
+O motor reconcilia, a cada 100 ms e a cada evento do registro, as ligações `iara.dev.output` (MASTER pessoal → dispositivo) e `iara.dev.input`
+(dispositivo → entrada do MIC): cria quando o dispositivo existe, remove quando some, espera ≥2 s entre tentativas e nunca troca de dispositivo.
+O módulo loopback se descarrega sozinho com `dont-fallback`; um listener do evento `destroy` do módulo evita destruí-lo duas vezes.
+
+| Etapa | Resultado |
+| --- | --- |
+| Preferências definidas | ligações criadas; tom de 0,03 chega ao monitor do HDMI em −33,57 dBFS (esperado ≈ −33,5) |
+| HDMI some (perfil off) | ligação removida; evento `DeviceAbsent`; MASTER pessoal sem destino (**nenhum fallback** para outro sink) |
+| HDMI volta | ligação recriada sozinha em ≤7 s; tom −33,62 dBFS; evento `DeviceBack` |
+| ezcap some e volta (entrada) | idem, com `DeviceAbsent`/`DeviceBack` |
+| Usuário escolhe “nenhuma saída” durante a ausência | na volta **não** recria a ligação antiga |
+| Fim | 0 nós `iara.*`; perfis das placas restaurados |
+| Dispositivos reais | saída do Iara coexiste com Cider e Zen no mesmo sink; microfone compartilhado com o Zen |
+
+Limites: a chave do dispositivo é o `node.name` (identificação persistente em aberto, spec 14); a escolha de alternativa autorizada, a geração da
+escolha e a política de “não forçar reprodução” ficam para o serviço; o motor só informa presença/ausência.
+
 ### O que isto NÃO prova
 
 - Medições longas (horas), CPU com medidores de nível ativos e com efeitos; o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.

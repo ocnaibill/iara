@@ -1,10 +1,10 @@
 //! Mixer mínimo por stdin para testar o motor de ponta a ponta (perfil → plano → PipeWire).
 //! Comandos: gain CANAL personal|transmission DB | mute CANAL personal|transmission true|false |
 //! enable CANAL personal|transmission true|false | mic-mute true|false | mic-gain DB | chatmix X |
-//! master-gain personal|transmission DB | quit
+//! master-gain personal|transmission DB | output NÓ|none | mic-device NÓ|none | events | quit
 use iara_audio::Engine;
 use iara_core::topology::plan;
-use iara_core::{initial_profile, Gain, Profile, SendControl};
+use iara_core::{initial_profile, DevicePreference, Gain, Profile, SendControl};
 use std::io::BufRead;
 
 fn send<'a>(p: &'a mut Profile, ch: &str, which: &str) -> Option<&'a mut SendControl> {
@@ -16,6 +16,12 @@ fn send<'a>(p: &'a mut Profile, ch: &str, which: &str) -> Option<&'a mut SendCon
     }
 }
 
+fn pref(node: &str) -> Option<DevicePreference> {
+    (node != "none").then(|| DevicePreference {
+        persistent_key: node.to_owned(),
+    })
+}
+
 fn gain(db: &str) -> Option<Gain> {
     Gain::from_db(db.parse().ok()?).ok()
 }
@@ -24,7 +30,10 @@ fn main() {
     let engine = Engine::start().expect("PipeWire indisponível");
     let mut profile = initial_profile();
     let apply = |p: &Profile| match plan(p).map(|pl| engine.apply(pl)) {
-        Ok(Ok(r)) => println!("ok observados={} ausentes={:?}", r.observed, r.missing),
+        Ok(Ok(r)) => println!(
+            "ok observados={} ausentes={:?} dispositivos_ausentes={:?}",
+            r.observed, r.missing, r.absent_devices
+        ),
         Ok(Err(e)) => println!("erro: {e}"),
         Err(e) => println!("perfil inválido: {e:?}"),
     };
@@ -60,6 +69,21 @@ fn main() {
                     _ => continue,
                 };
                 gain(db).map(|g| target.gain = g).is_some()
+            }
+            ["output", node] => {
+                profile.preferred_output = pref(node);
+                true
+            }
+            ["mic-device", node] => {
+                profile.preferred_microphone = pref(node);
+                true
+            }
+            ["events", ..] => {
+                for e in engine.events().try_iter() {
+                    println!("evento {e:?}");
+                }
+                println!("fim-eventos");
+                continue;
             }
             ["quit"] => break,
             _ => false,

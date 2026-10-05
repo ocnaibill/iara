@@ -18,6 +18,9 @@ pub const MIC_INPUT: &str = "iara.mic.input";
 pub const MIC_COMMON: &str = "iara.mic.common";
 pub const MIC_APPS: &str = "iara.mic.apps";
 /// Fontes virtuais selecionáveis por outros aplicativos (OBS, Discord): o MIC dedicado e a transmissão.
+/// Ligações com dispositivos físicos: saída pessoal (MASTER pessoal → dispositivo) e entrada do MIC (dispositivo → MIC_INPUT).
+pub const DEVICE_OUTPUT: &str = "iara.dev.output";
+pub const DEVICE_INPUT: &str = "iara.dev.input";
 pub const SOURCE_MIC: &str = "iara.src.mic";
 pub const SOURCE_TRANSMISSION: &str = "iara.src.transmission";
 
@@ -44,6 +47,22 @@ pub struct NodeSpec {
     pub description: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceDirection {
+    Output,
+    Input,
+}
+
+/// Ligação com um dispositivo físico, identificado pela chave persistente (hoje o `node.name`). O ciclo de vida
+/// (criar quando presente, remover quando ausente, nunca usar fallback) é do motor; o plano só diz o que se deseja.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceLink {
+    pub name: String,
+    pub direction: DeviceDirection,
+    pub physical: String,
+    pub bus: String,
+}
+
 /// Fonte virtual (`Audio/Source`) alimentada pelo monitor do nó `from`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceSpec {
@@ -67,6 +86,7 @@ pub struct Plan {
     pub nodes: Vec<NodeSpec>,
     pub branches: Vec<BranchSpec>,
     pub sources: Vec<SourceSpec>,
+    pub devices: Vec<DeviceLink>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -232,10 +252,28 @@ pub fn plan(profile: &Profile) -> Result<Plan, PlanError> {
             description: "Iara — Transmissão".into(),
         },
     ];
+    let mut devices = Vec::new();
+    if let Some(d) = &profile.preferred_output {
+        devices.push(DeviceLink {
+            name: DEVICE_OUTPUT.into(),
+            direction: DeviceDirection::Output,
+            physical: d.persistent_key.clone(),
+            bus: MASTER_PERSONAL.into(),
+        });
+    }
+    if let Some(d) = &profile.preferred_microphone {
+        devices.push(DeviceLink {
+            name: DEVICE_INPUT.into(),
+            direction: DeviceDirection::Input,
+            physical: d.persistent_key.clone(),
+            bus: MIC_INPUT.into(),
+        });
+    }
     Ok(Plan {
         nodes,
         branches,
         sources,
+        devices,
     })
 }
 
@@ -427,6 +465,39 @@ mod tests {
             .find(|n| n.name == channel_node("game"))
             .unwrap();
         assert_eq!(node.description, "Iara — Jogos");
+    }
+
+    #[test]
+    fn devices_follow_the_profile_preferences_only() {
+        use crate::DevicePreference;
+        let mut profile = initial_profile();
+        assert!(plan(&profile).unwrap().devices.is_empty());
+        profile.preferred_output = Some(DevicePreference {
+            persistent_key: "alsa_output.fone".into(),
+        });
+        profile.preferred_microphone = Some(DevicePreference {
+            persistent_key: "alsa_input.mic".into(),
+        });
+        let p = plan(&profile).unwrap();
+        assert_eq!(p.devices.len(), 2);
+        let out = p
+            .devices
+            .iter()
+            .find(|d| d.direction == DeviceDirection::Output)
+            .unwrap();
+        assert_eq!(
+            (out.physical.as_str(), out.bus.as_str()),
+            ("alsa_output.fone", MASTER_PERSONAL)
+        );
+        let inp = p
+            .devices
+            .iter()
+            .find(|d| d.direction == DeviceDirection::Input)
+            .unwrap();
+        assert_eq!(
+            (inp.physical.as_str(), inp.bus.as_str()),
+            ("alsa_input.mic", MIC_INPUT)
+        );
     }
 
     #[test]
