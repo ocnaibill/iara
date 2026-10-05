@@ -2,15 +2,16 @@
 
 Mixer de áudio para Linux, em Rust e GTK4. Licença MIT.
 
-Este workspace é um esqueleto inicial: não cria dispositivos, não move fluxos e não altera áudio ou preferências do sistema. O backend PipeWire e o IPC ainda não estão implementados. Veja [especificacao.md](docs/especificacao.md), especialmente a seção 6.3.
+O motor `iara-audio` cria nós virtuais `iara.*` no PipeWire da sessão enquanto o processo vive; o serviço, o IPC e a janela ainda não o usam. Nada é feito com dispositivos físicos nem com aplicativos. Veja [especificacao.md](docs/especificacao.md), especialmente a seção 6.3.
 
 ## Organização
 
-- `iara-core`: domínio compartilhado, ganhos, envios e fórmula do ChatMix; sem GTK/PipeWire.
+- `iara-core`: domínio compartilhado, ganhos, envios, fórmula do ChatMix e plano de topologia (`topology`: perfil → nós e ramos, diff); sem GTK/PipeWire.
+- `iara-audio`: motor PipeWire; aplica um plano por diferença no próprio processo (nós, loopbacks, ganho/mute por Props). Precisa de libpipewire e clang.
 - `iara-service`: ponto de entrada do serviço e contrato provisório do backend.
 - `iara-ui`: ponto de entrada GTK4, habilitado por feature para separar dependências nativas.
 
-O contrato de backend não comprova a viabilidade da topologia. O serviço retorna falha explícita enquanto não houver backend implementado.
+As provas da spec 6.3.2 estão em `docs/provas/registro.md` e `tools/provas/`; `tools/provas/07-motor-e2e.sh` exercita o motor real de ponta a ponta (cria nós temporários na sessão, mede e remove).
 
 ## Verificação
 

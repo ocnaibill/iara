@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/iara-core", "crates/iara-service", "crates/iara-ui"]
+members = ["crates/iara-core", "crates/iara-audio", "crates/iara-service", "crates/iara-ui"]
 default-members = ["crates/iara-core", "crates/iara-service"]
 resolver = "2"
 

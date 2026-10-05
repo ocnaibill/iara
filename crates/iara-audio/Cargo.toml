@@ -1,0 +1,9 @@
+[package]
+name = "iara-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+iara-core.workspace = true
+pipewire = "0.10"
