@@ -1,3 +1,4 @@
+use iara_core::apps::AppIdentity;
 use iara_core::topology::{
     diff, BranchSpec, DeviceDirection, DeviceLink, NodeSpec, Plan, SourceSpec, NODE_PREFIX,
 };
@@ -6,8 +7,10 @@ use pw::spa::param::ParamType;
 use pw::spa::pod::{serialize::PodSerializer, Object, Pod, Property, Value, ValueArray};
 use pw::spa::sys::{SPA_PROP_channelVolumes, SPA_PROP_mute, SPA_TYPE_OBJECT_Props};
 use pw::types::ObjectType;
+
+use crate::routing::{self, AppReport, Attempts, RouteTarget, StreamObs};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
 use std::io::Cursor;
 use std::rc::Rc;
@@ -48,6 +51,8 @@ pub enum Event {
     DeviceAbsent(String),
     /// O dispositivo preferido voltou; a ligação foi recriada.
     DeviceBack(String),
+    /// Estado dos aplicativos (fluxos de reprodução agrupados por aplicativo) quando algo muda.
+    Apps(Vec<AppReport>),
 }
 
 /// Resultado de uma aplicação. `missing` lista os nós esperados que não apareceram no registro dentro do prazo;
@@ -69,6 +74,7 @@ impl ApplyReport {
 type Reply = mpsc::Sender<Result<ApplyReport, EngineError>>;
 
 enum Command {
+    SetRoutes(HashMap<String, RouteTarget>),
     Apply(Box<Plan>, Reply),
     Shutdown,
 }
@@ -129,6 +135,13 @@ impl Engine {
     }
 
     /// Eventos acumulados (só para motores criados com `start()`).
+    /// Define para onde cada aplicativo (por chave de identidade) deve ir. Assíncrono: o resultado chega em `Event::Apps`.
+    pub fn set_routes(&self, routes: HashMap<String, RouteTarget>) -> Result<(), EngineError> {
+        self.tx
+            .send(Command::SetRoutes(routes))
+            .map_err(|_| EngineError::Disconnected)
+    }
+
     pub fn events(&self) -> impl Iterator<Item = Event> + '_ {
         self.events.iter().flat_map(|r| r.try_iter())
     }
@@ -198,6 +211,12 @@ impl Drop for ModuleHandle {
     }
 }
 
+struct StreamMeta {
+    app: AppIdentity,
+    media_name: String,
+    dont_move: bool,
+}
+
 struct Pending {
     expected: Vec<String>,
     deadline: Instant,
@@ -221,6 +240,18 @@ struct State {
     retry_after: HashMap<String, Instant>,
     /// Todos os nós do registro (id → node.name); base para saber se um dispositivo físico está presente.
     nodes_present: HashMap<u32, String>,
+    /// Fluxos de reprodução de aplicativos (não os do Iara), por id do nó.
+    streams: HashMap<u32, StreamMeta>,
+    /// Links do grafo: id → (nó de saída, nó de entrada).
+    links: HashMap<u32, (u32, u32)>,
+    /// Metadata `default` (onde se define o destino de cada fluxo) e seu id global.
+    metadata: Option<(u32, pw::metadata::Metadata)>,
+    /// Proxies dos fluxos de aplicativos, com o listener de `info`: as propriedades completas (ex.: `node.dont-move`)
+    /// só chegam depois do anúncio no registro.
+    stream_nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
+    routes: HashMap<String, RouteTarget>,
+    attempts: Attempts,
+    last_report: Option<Vec<AppReport>>,
 }
 
 fn props_pod(prop: u32, value: Value) -> Vec<u8> {
@@ -388,6 +419,56 @@ fn reconcile_devices(st: &mut State, context: &pw::context::ContextRc, ev: &Even
         .retain(|name, _| desired.iter().any(|d| &d.name == name));
 }
 
+/// Observações atuais dos fluxos de aplicativos, com os sinks aos quais cada um está ligado (pelos links reais).
+fn observe_streams(st: &State) -> Vec<StreamObs> {
+    st.streams
+        .iter()
+        .map(|(id, m)| {
+            let mut linked_to: Vec<String> = st
+                .links
+                .values()
+                .filter(|(out, _)| out == id)
+                .filter_map(|(_, inp)| st.nodes_present.get(inp).cloned())
+                .collect();
+            linked_to.sort();
+            linked_to.dedup();
+            StreamObs {
+                id: *id,
+                app: m.app.clone(),
+                media_name: m.media_name.clone(),
+                dont_move: m.dont_move,
+                linked_to,
+            }
+        })
+        .collect()
+}
+
+/// Decide e executa o roteamento dos fluxos e avisa quando o relatório de aplicativos muda.
+fn reconcile_routes(st: &mut State, ev: &EventSink) {
+    let now = Instant::now();
+    let streams = observe_streams(st);
+    let present: HashSet<String> = st.nodes_present.values().cloned().collect();
+    for a in routing::pending_actions(&streams, &st.routes, &st.attempts, &present) {
+        if a.send {
+            let Some((_, meta)) = st.metadata.as_ref() else {
+                continue;
+            };
+            match &a.target {
+                Some(t) => {
+                    meta.set_property(a.stream, "target.object", Some("Spa:String"), Some(t))
+                }
+                None => meta.set_property(a.stream, "target.object", None, None),
+            }
+        }
+        st.attempts.insert(a.stream, (a.target, now));
+    }
+    let report = routing::report(&streams, &st.routes, &st.attempts, now);
+    if st.last_report.as_ref() != Some(&report) {
+        st.last_report = Some(report.clone());
+        ev(Event::Apps(report));
+    }
+}
+
 fn check_pending(state: &Rc<RefCell<State>>, force: bool) {
     let mut st = state.borrow_mut();
     let Some(p) = st.pending.as_ref() else { return };
@@ -466,10 +547,33 @@ fn run(
         registry
             .add_listener_local()
             .global(move |g| {
-                if g.type_ != ObjectType::Node {
-                    return;
+                let props = g.props;
+                match g.type_ {
+                    ObjectType::Link => {
+                        let id = |k: &str| {
+                            props
+                                .and_then(|p| p.get(k))
+                                .and_then(|v| v.parse::<u32>().ok())
+                        };
+                        if let (Some(out), Some(inp)) =
+                            (id("link.output.node"), id("link.input.node"))
+                        {
+                            st_add.borrow_mut().links.insert(g.id, (out, inp));
+                        }
+                        return;
+                    }
+                    ObjectType::Metadata => {
+                        if props.and_then(|p| p.get("metadata.name")) == Some("default") {
+                            if let Ok(m) = reg.bind::<pw::metadata::Metadata, _>(g) {
+                                st_add.borrow_mut().metadata = Some((g.id, m));
+                            }
+                        }
+                        return;
+                    }
+                    ObjectType::Node => {}
+                    _ => return,
                 }
-                let Some(name) = g.props.and_then(|p| p.get("node.name")) else {
+                let Some(name) = props.and_then(|p| p.get("node.name")) else {
                     return;
                 };
                 // Presença de qualquer nó (inclusive dispositivos físicos) alimenta o reconciliador de dispositivos.
@@ -477,6 +581,73 @@ fn run(
                     .borrow_mut()
                     .nodes_present
                     .insert(g.id, name.to_owned());
+                // Fluxos de reprodução de aplicativos (os do próprio Iara não entram no inventário).
+                if props.and_then(|p| p.get("media.class")) == Some("Stream/Output/Audio")
+                    && !name.starts_with(NODE_PREFIX)
+                    && props.and_then(|p| p.get("iara.managed")) != Some("true")
+                {
+                    let get = |k: &str| {
+                        props
+                            .and_then(|p| p.get(k))
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_owned)
+                    };
+                    st_add.borrow_mut().streams.insert(
+                        g.id,
+                        StreamMeta {
+                            app: AppIdentity {
+                                // aplicativos em sandbox (Flatpak) expõem o id pelo portal; é melhor identidade que o binário
+                                app_id: get("application.id")
+                                    .or_else(|| get("pipewire.access.portal.app_id")),
+                                binary: get("application.process.binary"),
+                                name: get("application.name"),
+                            },
+                            media_name: get("media.name").unwrap_or_default(),
+                            dont_move: matches!(
+                                get("node.dont-move").as_deref(),
+                                Some("true" | "1")
+                            ),
+                        },
+                    );
+                }
+                if st_add.borrow().streams.contains_key(&g.id) {
+                    if let Ok(node) = reg.bind::<pw::node::Node, _>(g) {
+                        let (st_info, id) = (st_add.clone(), g.id);
+                        let listener = node
+                            .add_listener_local()
+                            .info(move |info| {
+                                // só quando este evento traz propriedades, e só os campos presentes (nunca apaga por omissão)
+                                if !info.change_mask().contains(pw::node::NodeChangeMask::PROPS) {
+                                    return;
+                                }
+                                let Some(p) = info.props() else { return };
+                                let get =
+                                    |k: &str| p.get(k).filter(|v| !v.is_empty()).map(str::to_owned);
+                                if let Some(m) = st_info.borrow_mut().streams.get_mut(&id) {
+                                    m.dont_move = matches!(
+                                        get("node.dont-move").as_deref(),
+                                        Some("true" | "1")
+                                    );
+                                    if let Some(v) = get("application.id")
+                                        .or_else(|| get("pipewire.access.portal.app_id"))
+                                    {
+                                        m.app.app_id = Some(v);
+                                    }
+                                    if let Some(v) = get("application.process.binary") {
+                                        m.app.binary = Some(v);
+                                    }
+                                    if let Some(v) = get("application.name") {
+                                        m.app.name = Some(v);
+                                    }
+                                }
+                            })
+                            .register();
+                        st_add
+                            .borrow_mut()
+                            .stream_nodes
+                            .insert(id, (node, listener));
+                    }
+                }
                 if !name.starts_with(NODE_PREFIX) {
                     return;
                 }
@@ -496,6 +667,13 @@ fn run(
                 let mut st = st_rm.borrow_mut();
                 st.seen.retain(|_, (gid, _)| *gid != id);
                 st.nodes_present.remove(&id);
+                st.streams.remove(&id);
+                st.stream_nodes.remove(&id);
+                st.links.remove(&id);
+                st.attempts.remove(&id);
+                if st.metadata.as_ref().is_some_and(|(mid, _)| *mid == id) {
+                    st.metadata = None;
+                }
             })
             .register()
     };
@@ -506,6 +684,7 @@ fn run(
         let ev = ev_tx.clone();
         mainloop.loop_().add_timer(move |_| {
             reconcile_devices(&mut st.borrow_mut(), &ctx, &ev);
+            reconcile_routes(&mut st.borrow_mut(), &ev);
             check_pending(&st, false);
         })
     };
@@ -519,6 +698,11 @@ fn run(
         let ev = ev_tx.clone();
         rx.attach(mainloop.loop_(), move |cmd| match cmd {
             Command::Shutdown => ml.quit(),
+            Command::SetRoutes(routes) => {
+                let mut s = st.borrow_mut();
+                s.routes = routes;
+                reconcile_routes(&mut s, &ev);
+            }
             Command::Apply(plan, reply) => apply(&st, &core, &ctx, &ev, *plan, reply),
         })
     };

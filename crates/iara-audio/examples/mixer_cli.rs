@@ -1,10 +1,11 @@
 //! Mixer mínimo por stdin para testar o motor de ponta a ponta (perfil → plano → PipeWire).
 //! Comandos: gain CANAL personal|transmission DB | mute CANAL personal|transmission true|false |
 //! enable CANAL personal|transmission true|false | mic-mute true|false | mic-gain DB | chatmix X |
-//! master-gain personal|transmission DB | output NÓ|none | mic-device NÓ|none | events | quit
-use iara_audio::Engine;
+//! master-gain personal|transmission DB | output NÓ|none | mic-device NÓ|none | route CHAVE NÓ|default | events | quit
+use iara_audio::{Engine, Event, RouteTarget};
 use iara_core::topology::plan;
 use iara_core::{initial_profile, DevicePreference, Gain, Profile, SendControl};
+use std::collections::HashMap;
 use std::io::BufRead;
 
 fn send<'a>(p: &'a mut Profile, ch: &str, which: &str) -> Option<&'a mut SendControl> {
@@ -29,6 +30,7 @@ fn gain(db: &str) -> Option<Gain> {
 fn main() {
     let engine = Engine::start().expect("PipeWire indisponível");
     let mut profile = initial_profile();
+    let mut routes: HashMap<String, RouteTarget> = HashMap::new();
     let apply = |p: &Profile| match plan(p).map(|pl| engine.apply(pl)) {
         Ok(Ok(r)) => println!(
             "ok observados={} ausentes={:?} dispositivos_ausentes={:?}",
@@ -78,9 +80,50 @@ fn main() {
                 profile.preferred_microphone = pref(node);
                 true
             }
+            ["route", key, node] => {
+                routes.insert(
+                    (*key).to_owned(),
+                    if *node == "default" {
+                        RouteTarget::Default
+                    } else {
+                        RouteTarget::Node((*node).to_owned())
+                    },
+                );
+                match engine.set_routes(routes.clone()) {
+                    Ok(()) => println!("rota definida"),
+                    Err(e) => println!("erro: {e}"),
+                }
+                continue;
+            }
             ["events", ..] => {
                 for e in engine.events() {
-                    println!("evento {e:?}");
+                    match e {
+                        Event::Apps(apps) => {
+                            for a in apps {
+                                let streams: Vec<String> = a
+                                    .streams
+                                    .iter()
+                                    .map(|s| {
+                                        format!(
+                                            "{}:{:?}->{}",
+                                            s.node_id,
+                                            s.state,
+                                            s.linked_to.join("+")
+                                        )
+                                    })
+                                    .collect();
+                                println!(
+                                    "app {} [{}] {:?} {}",
+                                    a.identity.display_name(),
+                                    a.identity.key().unwrap_or_default(),
+                                    a.state,
+                                    streams.join(" ")
+                                );
+                            }
+                            println!("--");
+                        }
+                        other => println!("evento {other:?}"),
+                    }
                 }
                 println!("fim-eventos");
                 continue;
