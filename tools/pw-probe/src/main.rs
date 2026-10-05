@@ -70,8 +70,9 @@ fn main() {
     let _rx = rx.attach(mainloop.loop_(), move |Cmd::Line(line)| {
         let w: Vec<&str> = line.split_whitespace().collect();
         match w.as_slice() {
-            ["null", name] => {
-                let p = pw::properties::properties! {
+            ["null", name, rest @ ..] => {
+                let linger = rest.first() == Some(&"linger");
+                let mut p = pw::properties::properties! {
                     "factory.name" => "support.null-audio-sink",
                     "node.name" => format!("iara_probe_{name}"),
                     "media.class" => "Audio/Sink",
@@ -81,6 +82,9 @@ fn main() {
                     "state.restore-props" => "false",
                     "state.restore-target" => "false"
                 };
+                if linger {
+                    p.insert("object.linger", "true");
+                }
                 match core2.create_object::<pw::node::Node>("adapter", &p) {
                     Ok(n) => own.borrow_mut().push(n),
                     Err(e) => eprintln!("null {name}: {e}"),

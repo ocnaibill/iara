@@ -83,9 +83,42 @@ repetições) mesmo com os links corretos. Opt-out por nó, confirmado: `state.r
 Consequência para o produto: **todos os nós criados pelo Iara devem declarar esse opt-out**; o estado desejado
 é do Iara, não do WirePlumber (spec 6.3: não disputar políticas globais).
 
+## Prova 04 — queda do processo, reinício do PipeWire e hospedagem no daemon
+
+Scripts: `tools/provas/04a-queda-do-processo.sh`, `04b-reinicio-pipewire.sh`, `04c-linger.sh`
+(sonda `tools/pw-probe`). Streams de teste: `pw-play` com destino explícito num sink do Iara (S1) e sem destino (S2).
+O reinício do PipeWire foi feito de verdade na sessão do usuário (`systemctl --user restart pipewire.service`).
+
+**04a — SIGKILL do processo proprietário (2 execuções, mesmo resultado)**
+
+| Momento | S1 (destino explícito `iara_probe_chan`) | S2 (sem destino) |
+| --- | --- | --- |
+| Processo vivo | → `iara_probe_chan` | → saída física padrão |
+| 3 s após SIGKILL | → **saída física** (fallback) | → saída física |
+| Nós recriados (4 s) | continua na saída física | igual |
+| `pw-metadata … target.object=iara_probe_chan` | volta ao `iara_probe_chan` em ≤2 s | igual |
+
+Leitura: a queda do serviço faz o fluxo cair na saída física (vaza para os alto-falantes) e **o fluxo não volta
+sozinho** quando o nó reaparece; o serviço precisa reencaminhar por metadata ao reiniciar. Metadata funciona para isso.
+
+**04b — reinício do PipeWire (1 execução)**
+- Todos os nós do processo sumiram do grafo (0 de 11), WirePlumber voltou ativo, dispositivos padrão preservados
+  (mesmos nomes; IDs renumerados) e os aplicativos da sessão (Zen, Cider) reconectaram à saída física.
+- O processo Rust **continuou vivo** e ainda acreditava que seus nós existiam (a sonda não ouve o erro do core):
+  sem tratamento de desconexão, o serviço ficaria “saudável” e sem áudio. É requisito: ouvir o erro do core,
+  invalidar proxies, reconectar e reconstruir sem duplicar (spec 8.8).
+- Tempo de indisponibilidade **não medido** (o `printf` do script usou o locale errado e o número é inválido).
+
+**04c — `object.linger` (nó criado no daemon via `create_object("adapter")`)**
+- Sem linger: o nó some junto com o processo. Com `object.linger=true`: **sobrevive ao SIGKILL** (removido depois
+  à mão com `pw-cli destroy`). Logo buses/sinks podem ficar no daemon, mas viram **órfãos** se ninguém os limpar:
+  o serviço precisa marcar seus objetos (prefixo/propriedade própria) e varrê-los na inicialização.
+- Os ramos com ganho (loopbacks) vivem no processo cliente e não têm equivalente com linger nesta prova. Hospedar tudo no
+  daemon por `pipewire.conf.d` **não foi testado** (exigiria reinícios extras e não permite canais dinâmicos sem recarregar).
+
 ### O que isto NÃO prova
 
-- Passos 5–8: aplicativos reais como clientes de captura, ausência/reconexão da entrada física, queda do processo/PipeWire e fallback, mudança de aplicativos por metadata, CPU/RAM/latência/xruns.
+- Passos 5, 7 e 8: clientes de captura reais, ausência/reconexão da entrada física e da saída física, política externa e `dont-move`, CPU/RAM/latência/xruns; tempo de indisponibilidade após reinício do PipeWire.
 - Microfone físico real (a prova 02 usa um sink nulo como fonte simulada); latência acumulada dos estágios encadeados (até 3 loopbacks em série no caminho do MIC) não foi medida.
 - Provas 01–02 usaram `pw-loopback`/`pw-cli`; a 03 usa um processo Rust, mas só no contexto cliente. Hospedagem no daemon (módulo em `pipewire.conf.d`) não foi testada e a decisão de hospedagem segue aberta.
 - A diferença de ~0,2 dB entre o RMS esperado (−9,03) e o medido (−9,25) na base não foi investigada.
