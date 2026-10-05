@@ -54,9 +54,38 @@ ganho por ramo são independentes; MASTER age só no seu mix; Não atribuídos n
 o ramo dedicado do MIC não sofre o MASTER nem os mutes dos envios, e o mute global silencia os três.
 Limpeza: nenhum nó `iara_proof_*` restou.
 
+## Prova 03 — nós hospedados por um processo Rust (bindings `pipewire` 0.10.1)
+
+Código: `tools/pw-probe` (crate descartável, fora do workspace) e `tools/provas/03-hospedagem-rust.sh`.
+O processo Rust conecta ao PipeWire, cria sinks nulos com `core.create_object("adapter", …)`, carrega
+`libpipewire-module-loopback` **no próprio contexto** (via `pipewire::sys::pw_context_load_module`, unsafe;
+não há wrapper seguro), liga os nós pelo registro e aplica `channelVolumes`/`mute` com `Node::set_param(Props)`.
+
+| Cenário | Pessoal | Transmissão |
+| --- | --- | --- |
+| Base | −9,23 | −9,23 |
+| Pessoal −6 dB (Props) | −15,28 | −9,27 |
+| Transmissão mute (flag, Props) | −9,27 | −∞ |
+
+- Build: `pipewire`/`pipewire-sys` 0.10.1 compilam contra libpipewire 1.6.9 (precisa de clang/bindgen).
+- Hospedagem no contexto do serviço: ao enviar SIGKILL ao processo, **nenhum** nó `iara_probe_*` restou
+  (0 nós no grafo). Logo não há órfãos, mas **o áudio dos canais some junto com o serviço**; o comportamento dos
+  aplicativos nesse momento (fallback do WirePlumber) ainda não foi observado.
+
+### Achado: o WirePlumber restaura volume/mute dos nós do próprio Iara
+
+`wireplumber` 0.5.18 grava em `~/.local/state/wireplumber/stream-properties` o volume e o mute de streams e sinks
+(chave `media.name` ou `node.name`) e os restaura quando o nó reaparece. Numa execução anterior o script
+foi encerrado com mute ativo; nas execuções seguintes o ramo de transmissão já nascia mudo (−∞ na base, 4 de 4
+repetições) mesmo com os links corretos. Opt-out por nó, confirmado: `state.restore-props=false` e
+`state.restore-target=false` nas propriedades do sink e dos streams do loopback; com o estado sujo
+(`mute:true`) ainda salvo, a base voltou a −9,23/−9,23 em 2 de 2 execuções.
+Consequência para o produto: **todos os nós criados pelo Iara devem declarar esse opt-out**; o estado desejado
+é do Iara, não do WirePlumber (spec 6.3: não disputar políticas globais).
+
 ### O que isto NÃO prova
 
 - Passos 5–8: aplicativos reais como clientes de captura, ausência/reconexão da entrada física, queda do processo/PipeWire e fallback, mudança de aplicativos por metadata, CPU/RAM/latência/xruns.
 - Microfone físico real (a prova 02 usa um sink nulo como fonte simulada); latência acumulada dos estágios encadeados (até 3 loopbacks em série no caminho do MIC) não foi medida.
-- Os nós foram hospedados por processos `pw-loopback`/`pw-cli`, não por um serviço Rust; a decisão de hospedagem segue aberta.
+- Provas 01–02 usaram `pw-loopback`/`pw-cli`; a 03 usa um processo Rust, mas só no contexto cliente. Hospedagem no daemon (módulo em `pipewire.conf.d`) não foi testada e a decisão de hospedagem segue aberta.
 - A diferença de ~0,2 dB entre o RMS esperado (−9,03) e o medido (−9,25) na base não foi investigada.

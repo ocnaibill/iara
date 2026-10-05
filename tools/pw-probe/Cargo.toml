@@ -1,0 +1,12 @@
+[package]
+name = "iara-pw-probe"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Fora do workspace principal: prova descartável de bindings (spec 6.3.1/6.3.2).
+[workspace]
+
+[dependencies]
+pipewire = "0.10"
