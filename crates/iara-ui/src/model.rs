@@ -3,7 +3,7 @@
 
 use iara_core::edit::EditCommand;
 use iara_core::{chatmix, Gain, Profile, SendControl};
-use iara_ipc::State;
+use iara_ipc::{AppEntry, AppSource, AppState, SessionChoice, State};
 
 /// Menor posição positiva do slider: p = 0 é silêncio exato; qualquer p > 0 é um ganho de −60 a 0 dB (spec 5).
 pub const MIN_POSITION: f64 = 1e-6;
@@ -197,16 +197,28 @@ fn coalesce_key(cmd: &EditCommand) -> Option<String> {
 /// Reduz uma fila de comandos pendentes: dos ajustes de valor para o mesmo alvo fica só o último (na posição do último);
 /// o resto (mutes, habilitações, ações estruturais) segue intacto e em ordem.
 pub fn coalesce(commands: Vec<EditCommand>) -> Vec<EditCommand> {
+    coalesce_by(commands, coalesce_key)
+}
+
+/// Igual a `coalesce`, para a fila da janela (edições e escolhas de sessão; estas nunca se fundem).
+pub fn coalesce_ui(commands: Vec<UiCommand>) -> Vec<UiCommand> {
+    coalesce_by(commands, |c| match c {
+        UiCommand::Edit(e) => coalesce_key(e),
+        UiCommand::Session { .. } => None,
+    })
+}
+
+fn coalesce_by<T>(items: Vec<T>, key: impl Fn(&T) -> Option<String>) -> Vec<T> {
     let mut last: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (i, c) in commands.iter().enumerate() {
-        if let Some(k) = coalesce_key(c) {
+    for (i, c) in items.iter().enumerate() {
+        if let Some(k) = key(c) {
             last.insert(k, i);
         }
     }
-    commands
+    items
         .into_iter()
         .enumerate()
-        .filter(|(i, c)| coalesce_key(c).is_none_or(|k| last[&k] == *i))
+        .filter(|(i, c)| key(c).is_none_or(|k| last[&k] == *i))
         .map(|(_, c)| c)
         .collect()
 }
@@ -254,6 +266,110 @@ pub fn status_lines(state: &State) -> Vec<StatusLine> {
         });
     }
     lines
+}
+
+/// Comando que a janela envia ao serviço: edição do perfil ou escolha só desta sessão.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UiCommand {
+    Edit(EditCommand),
+    Session { key: String, choice: SessionChoice },
+}
+
+/// Mover um aplicativo para `channel` (`None` = Não atribuídos). Salva uma regra no perfil, ou, com `session_only`,
+/// vale só nesta sessão. `None` se o aplicativo não tem identificação utilizável (não se adivinha, spec 7).
+pub fn move_app(app: &AppEntry, channel: Option<&str>, session_only: bool) -> Option<UiCommand> {
+    if session_only {
+        let choice = channel.map_or(SessionChoice::Unassigned, |c| {
+            SessionChoice::Channel(c.to_owned())
+        });
+        return Some(UiCommand::Session {
+            key: app.key.clone()?,
+            choice,
+        });
+    }
+    Some(UiCommand::Edit(EditCommand::AssignApp {
+        matcher: app.identity().suggested_matcher()?,
+        channel: channel.map(str::to_owned),
+    }))
+}
+
+/// "Reaplicar regra": apaga a escolha temporária do aplicativo.
+pub fn reapply_rule(app: &AppEntry) -> Option<UiCommand> {
+    Some(UiCommand::Session {
+        key: app.key.clone()?,
+        choice: SessionChoice::Clear,
+    })
+}
+
+/// Etiqueta de aplicativo dentro de uma coluna.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppChip {
+    pub app: AppEntry,
+    /// Marca curta ao lado do nome quando o estado pede atenção (vazia se aplicado).
+    pub glyph: &'static str,
+    pub tooltip: String,
+    /// Escolha só desta sessão (borda tracejada na interface).
+    pub temporary: bool,
+    /// Em silêncio (regra salva, sem fluxo): aparece esmaecido.
+    pub idle: bool,
+}
+
+pub fn state_text(state: AppState) -> &'static str {
+    match state {
+        AppState::Applied => "aplicado",
+        AppState::Applying => "aplicando",
+        AppState::Partial => "aplicado em parte dos fluxos",
+        AppState::NotApplied => "não foi possível mover o áudio deste aplicativo",
+        AppState::Elsewhere => "está em outro canal (movido por fora; respeitado)",
+        AppState::DontMove => "o aplicativo não aceita ser movido",
+        AppState::Waiting => "aguardando áudio",
+        AppState::Unmanaged => "sem identificação suficiente",
+    }
+}
+
+fn glyph(state: AppState) -> &'static str {
+    match state {
+        AppState::Applied | AppState::Waiting => "",
+        AppState::Applying => "…",
+        AppState::Partial => "◐",
+        AppState::NotApplied | AppState::DontMove | AppState::Unmanaged => "⚠",
+        AppState::Elsewhere => "↪",
+    }
+}
+
+fn chip(app: &AppEntry) -> AppChip {
+    let origin = match app.source {
+        AppSource::Session => "escolha só desta sessão",
+        AppSource::Rule => "regra salva no perfil",
+        AppSource::Default => "sem regra",
+    };
+    let mut tooltip = format!("{} — {} ({origin})", app.display, state_text(app.state));
+    if app.state == AppState::NotApplied || app.state == AppState::DontMove {
+        tooltip.push_str(
+            ". A associação está salva; confira a saída de áudio nas configurações do aplicativo.",
+        );
+    }
+    AppChip {
+        glyph: glyph(app.state),
+        tooltip,
+        temporary: app.source == AppSource::Session,
+        idle: app.state == AppState::Waiting,
+        app: app.clone(),
+    }
+}
+
+/// Etiquetas por coluna: a chave é o id do canal; `""` é a coluna MASTER (Não atribuídos). Ordem por nome, estável.
+pub fn chips_by_column(state: &State) -> std::collections::HashMap<String, Vec<AppChip>> {
+    let mut out: std::collections::HashMap<String, Vec<AppChip>> = std::collections::HashMap::new();
+    for a in &state.apps {
+        out.entry(a.channel.clone().unwrap_or_default())
+            .or_default()
+            .push(chip(a));
+    }
+    for v in out.values_mut() {
+        v.sort_by_key(|c| (c.app.display.to_lowercase(), c.app.key.clone()));
+    }
+    out
 }
 
 /// Id lógico a partir de um nome digitado: minúsculas ASCII, dígitos, `-` e `_`; único entre `existing`. `None` se o nome
@@ -320,6 +436,7 @@ mod tests {
             persist_error: None,
             absent_devices: vec![],
             reconnect_attempts: 0,
+            apps: vec![],
         }
     }
 
@@ -519,5 +636,184 @@ mod tests {
         );
         assert!(unavailable_text("procurando…").contains("não está em execução"));
         assert!(unavailable_text("barramento sumiu").contains("barramento sumiu"));
+    }
+
+    fn entry(
+        display: &str,
+        key: Option<&str>,
+        binary: Option<&str>,
+        channel: Option<&str>,
+        source: AppSource,
+        st: AppState,
+    ) -> AppEntry {
+        AppEntry {
+            key: key.map(Into::into),
+            display: display.into(),
+            app_id: None,
+            binary: binary.map(Into::into),
+            name: Some(display.into()),
+            channel: channel.map(Into::into),
+            source,
+            state: st,
+            streams: 1,
+        }
+    }
+
+    #[test]
+    fn moving_an_app_saves_a_rule_or_only_a_session_choice_and_never_guesses_an_identity() {
+        let zen = entry(
+            "Zen",
+            Some("bin:zen"),
+            Some("zen"),
+            None,
+            AppSource::Default,
+            AppState::Applied,
+        );
+        match move_app(&zen, Some("media"), false).unwrap() {
+            UiCommand::Edit(EditCommand::AssignApp { matcher, channel }) => {
+                assert_eq!(
+                    (matcher.binary.as_deref(), matcher.name, channel.as_deref()),
+                    (Some("zen"), None, Some("media"))
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            move_app(&zen, Some("game"), true),
+            Some(UiCommand::Session {
+                key: "bin:zen".into(),
+                choice: SessionChoice::Channel("game".into())
+            })
+        );
+        assert_eq!(
+            move_app(&zen, None, true),
+            Some(UiCommand::Session {
+                key: "bin:zen".into(),
+                choice: SessionChoice::Unassigned
+            })
+        );
+        assert!(matches!(
+            move_app(&zen, None, false),
+            Some(UiCommand::Edit(EditCommand::AssignApp {
+                channel: None,
+                ..
+            }))
+        ));
+        assert_eq!(
+            reapply_rule(&zen),
+            Some(UiCommand::Session {
+                key: "bin:zen".into(),
+                choice: SessionChoice::Clear
+            })
+        );
+        // sem identificação utilizável: nada a enviar
+        let anon = AppEntry {
+            key: None,
+            binary: None,
+            name: None,
+            ..zen
+        };
+        assert_eq!(
+            (
+                move_app(&anon, Some("game"), false),
+                move_app(&anon, Some("game"), true),
+                reapply_rule(&anon)
+            ),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn chips_group_by_channel_sort_by_name_and_describe_problems_in_text() {
+        let mut s = state(initial_profile());
+        s.apps = vec![
+            entry(
+                "Zen",
+                Some("bin:zen"),
+                Some("zen"),
+                Some("media"),
+                AppSource::Rule,
+                AppState::Applied,
+            ),
+            entry(
+                "cider",
+                Some("bin:cider"),
+                Some("cider"),
+                Some("media"),
+                AppSource::Session,
+                AppState::Elsewhere,
+            ),
+            entry(
+                "Discord",
+                Some("bin:discord"),
+                Some("discord"),
+                Some("chat"),
+                AppSource::Rule,
+                AppState::Waiting,
+            ),
+            entry(
+                "Jogo",
+                Some("bin:jogo"),
+                Some("jogo"),
+                None,
+                AppSource::Default,
+                AppState::DontMove,
+            ),
+        ];
+        let by = chips_by_column(&s);
+        let media: Vec<_> = by["media"].iter().map(|c| c.app.display.as_str()).collect();
+        assert_eq!(
+            media,
+            ["cider", "Zen"],
+            "ordem por nome, sem diferenciar maiúsculas"
+        );
+        assert!(by["media"][0].temporary && !by["media"][1].temporary);
+        assert_eq!(by["media"][0].glyph, "↪");
+        assert_eq!(by["media"][1].glyph, "");
+        assert!(by["chat"][0].idle && by["chat"][0].tooltip.contains("aguardando áudio"));
+        // Não atribuídos fica na coluna "" (MASTER); com recusa, o tooltip orienta sem culpar o aplicativo
+        let jogo = &by[""][0];
+        assert_eq!(jogo.glyph, "⚠");
+        assert!(
+            jogo.tooltip.contains("não aceita ser movido")
+                && jogo.tooltip.contains("associação está salva")
+        );
+        // todo estado tem texto (cor nunca é o único indicador)
+        for st in [
+            AppState::Applied,
+            AppState::Applying,
+            AppState::Partial,
+            AppState::NotApplied,
+            AppState::Elsewhere,
+            AppState::DontMove,
+            AppState::Waiting,
+            AppState::Unmanaged,
+        ] {
+            assert!(!state_text(st).is_empty());
+        }
+    }
+
+    #[test]
+    fn the_ui_queue_collapses_slider_bursts_but_never_merges_session_choices() {
+        let g = |db: f64| Gain::from_db(db).unwrap();
+        let gain = |db: f64| {
+            UiCommand::Edit(EditCommand::SetChannelGain {
+                channel: "game".into(),
+                send: SendKind::Personal,
+                gain: g(db),
+            })
+        };
+        let session = |c: &str| UiCommand::Session {
+            key: "bin:zen".into(),
+            choice: SessionChoice::Channel(c.into()),
+        };
+        let out = coalesce_ui(vec![
+            gain(-1.0),
+            session("game"),
+            gain(-2.0),
+            session("chat"),
+            gain(-3.0),
+        ]);
+        assert_eq!(out, vec![session("game"), session("chat"), gain(-3.0)]);
     }
 }

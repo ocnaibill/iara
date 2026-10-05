@@ -3,14 +3,14 @@
 
 use crate::backend::{Backend, OnUpdate, Update};
 use crate::model::{
-    chatmix_view, columns, position_to_gain, slug, status_lines, ColumnKind, ColumnView, SendView,
-    StatusKind,
+    chatmix_view, chips_by_column, columns, move_app, position_to_gain, reapply_rule, slug,
+    status_lines, AppChip, ColumnKind, ColumnView, SendView, StatusKind, UiCommand,
 };
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 use iara_core::edit::{EditCommand, MicSend, SendKind};
 use iara_core::Gain;
-use iara_ipc::State;
+use iara_ipc::{AppEntry, AppSource, AppState, State};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -31,7 +31,7 @@ window.iara { background: #0e1b22; color: #d8e6ea; }
 .iara .value { font-feature-settings: 'tnum'; font-size: 12px; }
 .iara .note { color: #f2b35e; font-size: 10px; }
 .iara scale trough { background: #1f3a45; min-width: 6px; min-height: 6px; border-radius: 6px; }
-.iara scale highlight { background: #5ad1c5; border-radius: 6px; border: none; }
+.iara scale highlight { background: #5ad1c5; border-radius: 6px; border: none; margin: 0; min-width: 0; min-height: 0; }
 .iara scale.tx highlight { background: #f2b35e; }
 .iara scale slider { background: #e8f2f4; min-width: 20px; min-height: 12px; margin: 0; border-radius: 4px; border: none; box-shadow: 0 1px 3px rgba(0,0,0,.5); }
 .iara .off scale highlight { background: #3a5560; }
@@ -49,6 +49,14 @@ window.iara { background: #0e1b22; color: #d8e6ea; }
 .iara .add { background: transparent; border: 1px dashed #2c4a56; border-radius: 10px; color: #7e98a1; min-width: 56px; }
 .iara .chatmix { background: #14262e; border-radius: 10px; padding: 8px 14px; }
 .iara .muted-text { color: #7e98a1; }
+.iara .apps-title { color: #7e98a1; font-size: 9.5px; letter-spacing: 0.4px; margin-top: 4px; }
+.iara menubutton.chip > button { background: #1b323c; border: 1px solid #2c4a56; border-radius: 8px; color: #d8e6ea; padding: 2px 8px; min-height: 22px; font-size: 12px; }
+.iara menubutton.chip > button arrow { min-width: 0; min-height: 0; -gtk-icon-size: 0px; margin: 0; }
+.iara menubutton.chip.temp > button { border-style: dashed; border-color: #f2b35e; }
+.iara menubutton.chip.idle > button { color: #7e98a1; background: transparent; }
+.iara menubutton.chip.attention > button { border-color: #ef6f6c; }
+.iara .column.drop-target { border: 1px dashed #5ad1c5; background: #1a3640; }
+.iara .apps-empty { color: #4f6a74; font-size: 11px; }
 ";
 
 #[derive(Clone)]
@@ -59,6 +67,18 @@ pub struct Options {
 }
 
 type Emit = Rc<dyn Fn(EditCommand)>;
+type EmitUi = Rc<dyn Fn(UiCommand)>;
+
+/// O que as etiquetas de aplicativos precisam saber: enviar comandos, a lista atual e os canais (para o menu "Mover para").
+#[derive(Clone)]
+struct AppsCtx {
+    emit: EmitUi,
+    apps: Rc<RefCell<Vec<AppEntry>>>,
+    /// (id, nome) dos canais do perfil, na ordem das colunas.
+    channels: Rc<RefCell<Vec<(String, String)>>>,
+    /// Interruptor do cabeçalho: mover só nesta sessão em vez de salvar a regra.
+    session_only: Rc<Cell<bool>>,
+}
 
 struct Strip {
     root: gtk::Box,
@@ -227,6 +247,9 @@ struct Column {
     personal: Strip,
     transmission: Strip,
     mic: Option<MicWidgets>,
+    /// Lista de etiquetas de aplicativos (MASTER = Não atribuídos; canais = aplicativos do canal); não existe no MIC.
+    apps_box: Option<gtk::Box>,
+    chip_sig: RefCell<String>,
 }
 
 impl Column {
@@ -306,13 +329,7 @@ fn kind_handlers(kind: &ColumnKind, id: &str, send: SendKind, emit: &Emit) -> Ha
     }
 }
 
-fn manage_menu(
-    id: &str,
-    name: &str,
-    existing: &Rc<RefCell<Vec<String>>>,
-    emit: &Emit,
-) -> gtk::MenuButton {
-    let _ = existing;
+fn manage_menu(id: &str, name: &str, others: &[(String, String)], emit: &Emit) -> gtk::MenuButton {
     let pop = gtk::Popover::new();
     let bx = gtk::Box::new(gtk::Orientation::Vertical, 6);
     bx.set_margin_top(8);
@@ -323,8 +340,22 @@ fn manage_menu(
     let rename = gtk::Button::with_label("Renomear");
     let remove = gtk::Button::with_label("Remover canal");
     remove.add_css_class("destructive-action");
+    // spec 8.3: quem remove escolhe para onde vão as regras (outro canal ou Não atribuídos); nunca se assume
+    let mut labels = vec!["Não atribuídos".to_owned()];
+    labels.extend(others.iter().map(|(_, n)| n.clone()));
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let dest = gtk::DropDown::from_strings(&label_refs);
+    dest.update_property(&[gtk::accessible::Property::Label(
+        "Destino dos aplicativos deste canal ao remover",
+    )]);
     bx.append(&entry);
     bx.append(&rename);
+    bx.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    bx.append(&label(
+        "Ao remover, os aplicativos vão para:",
+        "strip-caption",
+    ));
+    bx.append(&dest);
     bx.append(&remove);
     pop.set_child(Some(&bx));
     {
@@ -343,11 +374,18 @@ fn manage_menu(
     {
         // remoção em duas etapas: o primeiro clique pede confirmação
         let (e, id, pop_c) = (emit.clone(), id.to_owned(), pop.clone());
+        let (others, dest) = (others.to_vec(), dest.clone());
         remove.connect_clicked(move |b| {
             if b.label().as_deref() == Some("Confirmar remoção") {
+                let pick = dest.selected() as usize;
+                let destination = if pick == 0 {
+                    None
+                } else {
+                    others.get(pick - 1).map(|(i, _)| i.clone())
+                };
                 e(EditCommand::RemoveChannel {
                     channel: id.clone(),
-                    destination: None,
+                    destination,
                 });
                 pop_c.popdown();
             } else {
@@ -367,12 +405,7 @@ fn manage_menu(
     mb
 }
 
-fn build_column(
-    v: &ColumnView,
-    emit: &Emit,
-    updating: &Rc<Cell<bool>>,
-    existing: &Rc<RefCell<Vec<String>>>,
-) -> Column {
+fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &AppsCtx) -> Column {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
     root.add_css_class("column");
     if v.kind == ColumnKind::Master {
@@ -385,7 +418,14 @@ fn build_column(
     title.set_xalign(0.0);
     head.append(&title);
     if v.kind == ColumnKind::Channel {
-        head.append(&manage_menu(&v.id, &v.title, existing, emit));
+        let others: Vec<(String, String)> = ctx
+            .channels
+            .borrow()
+            .iter()
+            .filter(|(i, _)| *i != v.id)
+            .cloned()
+            .collect();
+        head.append(&manage_menu(&v.id, &v.title, &others, emit));
     }
     root.append(&head);
 
@@ -494,6 +534,61 @@ fn build_column(
         ex.set_child(Some(&inner));
         root.append(&ex);
     }
+    let apps_box = (v.kind != ColumnKind::Mic).then(|| {
+        let title = if v.kind == ColumnKind::Master {
+            "NÃO ATRIBUÍDOS"
+        } else {
+            "APLICATIVOS"
+        };
+        root.append(&label(title, "apps-title"));
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&list)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .min_content_height(84)
+            .max_content_height(150)
+            .propagate_natural_height(true)
+            .build();
+        root.append(&scroller);
+        // soltar um aplicativo nesta coluna o associa a este canal (MASTER = volta a Não atribuídos)
+        let target = gtk::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
+        let (ctx2, channel) = (
+            ctx.clone(),
+            (v.kind == ColumnKind::Channel).then(|| v.id.clone()),
+        );
+        target.connect_drop(move |_, value, _, _| {
+            let Ok(key) = value.get::<String>() else {
+                return false;
+            };
+            let app = ctx2
+                .apps
+                .borrow()
+                .iter()
+                .find(|a| a.key.as_deref() == Some(key.as_str()))
+                .cloned();
+            match app.and_then(|a| move_app(&a, channel.as_deref(), ctx2.session_only.get())) {
+                Some(cmd) => {
+                    (ctx2.emit)(cmd);
+                    true
+                }
+                None => false,
+            }
+        });
+        let r = root.clone();
+        target.connect_enter(move |_, _, _| {
+            r.add_css_class("drop-target");
+            gdk::DragAction::MOVE
+        });
+        let r = root.clone();
+        target.connect_leave(move |_| r.remove_css_class("drop-target"));
+        let r = root.clone();
+        target.connect_drop(move |_, _, _, _| {
+            r.remove_css_class("drop-target");
+            false
+        });
+        root.add_controller(target);
+        list
+    });
     root.set_size_request(
         if v.kind == ColumnKind::Master {
             176
@@ -510,9 +605,101 @@ fn build_column(
         personal,
         transmission,
         mic,
+        apps_box,
+        chip_sig: RefCell::new(String::new()),
     };
     col.apply(v);
     col
+}
+
+/// Etiqueta de um aplicativo: clique abre o menu "Mover para…" (alternativa por teclado ao arrastar); arrastar a move.
+fn build_chip(chip: &AppChip, ctx: &AppsCtx) -> gtk::MenuButton {
+    let text = if chip.glyph.is_empty() {
+        chip.app.display.clone()
+    } else {
+        format!("{} {}", chip.app.display, chip.glyph)
+    };
+    let pop = gtk::Popover::new();
+    let bx = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    for set in [
+        gtk::Widget::set_margin_top,
+        gtk::Widget::set_margin_bottom,
+        gtk::Widget::set_margin_start,
+        gtk::Widget::set_margin_end,
+    ] {
+        set(bx.upcast_ref(), 8);
+    }
+    bx.append(&label(&chip.tooltip, "strip-caption"));
+    let session = gtk::CheckButton::with_label("Somente nesta sessão");
+    session.set_active(ctx.session_only.get());
+    let mut targets: Vec<(Option<String>, String)> = ctx
+        .channels
+        .borrow()
+        .iter()
+        .map(|(id, name)| (Some(id.clone()), name.clone()))
+        .collect();
+    targets.push((None, "Não atribuídos".to_owned()));
+    for (channel, name) in targets {
+        let b = gtk::Button::with_label(&format!("Mover para {name}"));
+        b.add_css_class("flat-btn");
+        b.set_sensitive(chip.app.channel != channel || chip.app.source == AppSource::Session);
+        let (app, emit, pop2, session2) = (
+            chip.app.clone(),
+            ctx.emit.clone(),
+            pop.clone(),
+            session.clone(),
+        );
+        b.connect_clicked(move |_| {
+            if let Some(cmd) = move_app(&app, channel.as_deref(), session2.is_active()) {
+                emit(cmd);
+            }
+            pop2.popdown();
+        });
+        bx.append(&b);
+    }
+    bx.append(&session);
+    if chip.app.source == AppSource::Session {
+        let b = gtk::Button::with_label("Reaplicar regra do perfil");
+        b.add_css_class("flat-btn");
+        let (app, emit, pop2) = (chip.app.clone(), ctx.emit.clone(), pop.clone());
+        b.connect_clicked(move |_| {
+            if let Some(cmd) = reapply_rule(&app) {
+                emit(cmd);
+            }
+            pop2.popdown();
+        });
+        bx.append(&b);
+    }
+    pop.set_child(Some(&bx));
+    let mb = gtk::MenuButton::builder()
+        .label(&text)
+        .popover(&pop)
+        .tooltip_text(&chip.tooltip)
+        .always_show_arrow(false)
+        .build();
+    mb.add_css_class("chip");
+    if chip.temporary {
+        mb.add_css_class("temp");
+    }
+    if chip.idle {
+        mb.add_css_class("idle");
+    }
+    if matches!(
+        chip.app.state,
+        AppState::NotApplied | AppState::DontMove | AppState::Unmanaged
+    ) {
+        mb.add_css_class("attention");
+    }
+    mb.update_property(&[gtk::accessible::Property::Label(&chip.tooltip)]);
+    mb.set_halign(gtk::Align::Start);
+    if let Some(key) = chip.app.key.clone() {
+        let src = gtk::DragSource::builder()
+            .actions(gdk::DragAction::MOVE)
+            .build();
+        src.connect_prepare(move |_, _, _| Some(gdk::ContentProvider::for_value(&key.to_value())));
+        mb.add_controller(src);
+    }
+    mb
 }
 
 struct ChatMixBar {
@@ -533,6 +720,7 @@ struct Ui {
     updating: Rc<Cell<bool>>,
     existing: Rc<RefCell<Vec<String>>>,
     emit: Emit,
+    ctx: AppsCtx,
     transient: RefCell<Option<String>>,
 }
 
@@ -573,6 +761,40 @@ impl Ui {
         self.banner.set_visible(!lines.is_empty());
     }
 
+    /// Refaz as etiquetas só das colunas cuja lista mudou (reconstruir com um menu aberto o fecharia).
+    fn refresh_chips(&self, state: &State) {
+        let by = chips_by_column(state);
+        for col in self.cols.borrow().iter() {
+            let Some(list) = &col.apps_box else { continue };
+            let key = if col.kind == ColumnKind::Master {
+                ""
+            } else {
+                col.id.as_str()
+            };
+            let chips = by.get(key).cloned().unwrap_or_default();
+            let sig = format!(
+                "{:?}",
+                chips
+                    .iter()
+                    .map(|c| (&c.app, c.glyph, c.temporary, c.idle))
+                    .collect::<Vec<_>>()
+            );
+            if *col.chip_sig.borrow() == sig {
+                continue;
+            }
+            *col.chip_sig.borrow_mut() = sig;
+            while let Some(c) = list.first_child() {
+                list.remove(&c);
+            }
+            if chips.is_empty() {
+                list.append(&label("nenhum aplicativo", "apps-empty"));
+            }
+            for c in &chips {
+                list.append(&build_chip(c, &self.ctx));
+            }
+        }
+    }
+
     fn apply_state(&self, state: &State, unavailable: Option<&str>) {
         self.updating.set(true);
         *self.existing.borrow_mut() = state
@@ -582,6 +804,13 @@ impl Ui {
             .map(|c| c.id.clone())
             .collect();
         self.profile.set_text(&format!("— {}", state.profile.name));
+        *self.ctx.apps.borrow_mut() = state.apps.clone();
+        *self.ctx.channels.borrow_mut() = state
+            .profile
+            .channels
+            .iter()
+            .map(|c| (c.id.clone(), c.name.clone()))
+            .collect();
         let views = columns(&state.profile);
         let same = {
             let cols = self.cols.borrow();
@@ -597,7 +826,7 @@ impl Ui {
             }
             let built: Vec<Column> = views
                 .iter()
-                .map(|v| build_column(v, &self.emit, &self.updating, &self.existing))
+                .map(|v| build_column(v, &self.emit, &self.updating, &self.ctx))
                 .collect();
             for c in &built {
                 self.row.append(&c.root);
@@ -609,6 +838,7 @@ impl Ui {
                 c.apply(v);
             }
         }
+        self.refresh_chips(state);
         match chatmix_view(&state.profile) {
             Some(cm) => {
                 self.chatmix.first.set_text(&cm.first);
@@ -681,6 +911,17 @@ pub fn demo_state() -> State {
     ] {
         p = apply(&p, &cmd).expect("demo").0;
     }
+    let app = |name: &str, bin: &str, ch: Option<&str>, src: AppSource, st: AppState| AppEntry {
+        key: Some(format!("bin:{bin}")),
+        display: name.into(),
+        app_id: None,
+        binary: Some(bin.into()),
+        name: Some(name.into()),
+        channel: ch.map(Into::into),
+        source: src,
+        state: st,
+        streams: 1,
+    };
     State {
         serial: 1,
         profile: p,
@@ -688,6 +929,57 @@ pub fn demo_state() -> State {
         persist_error: None,
         absent_devices: vec!["alsa_output.usb-fone-exemplo".into()],
         reconnect_attempts: 0,
+        apps: vec![
+            app(
+                "Zen",
+                "zen",
+                Some("media"),
+                AppSource::Rule,
+                AppState::Applied,
+            ),
+            app(
+                "Cider",
+                "cider",
+                Some("media"),
+                AppSource::Rule,
+                AppState::Applied,
+            ),
+            app(
+                "Discord",
+                "discord",
+                Some("chat"),
+                AppSource::Rule,
+                AppState::Waiting,
+            ),
+            app(
+                "Jogo",
+                "jogo",
+                Some("game"),
+                AppSource::Rule,
+                AppState::DontMove,
+            ),
+            app(
+                "Steam",
+                "steam",
+                Some("game"),
+                AppSource::Session,
+                AppState::Applied,
+            ),
+            app(
+                "Spotify",
+                "spotify",
+                None,
+                AppSource::Default,
+                AppState::Applied,
+            ),
+            app(
+                "Firefox",
+                "firefox",
+                None,
+                AppSource::Default,
+                AppState::Applied,
+            ),
+        ],
     }
 }
 
@@ -720,13 +1012,23 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
     }
 
     let backend: Rc<RefCell<Option<Backend>>> = Rc::default();
-    let emit: Emit = {
+    let emit_ui: EmitUi = {
         let b = backend.clone();
         Rc::new(move |cmd| {
             if let Some(b) = b.borrow().as_ref() {
                 b.send(cmd);
             }
         })
+    };
+    let emit: Emit = {
+        let e = emit_ui.clone();
+        Rc::new(move |cmd| e(UiCommand::Edit(cmd)))
+    };
+    let ctx = AppsCtx {
+        emit: emit_ui,
+        apps: Rc::default(),
+        channels: Rc::default(),
+        session_only: Rc::new(Cell::new(false)),
     };
 
     let window = gtk::ApplicationWindow::builder()
@@ -742,6 +1044,16 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
     let profile = label("", "profile");
     title.append(&profile);
     header.set_title_widget(Some(&title));
+    // arrastar ou mover um aplicativo salva uma regra; com este interruptor vale só nesta sessão (spec 8.1)
+    let session_toggle = gtk::ToggleButton::with_label("Mover só nesta sessão");
+    session_toggle.set_tooltip_text(Some(
+        "Ligado: mover um aplicativo vale só até ele parar de tocar, sem salvar a regra no perfil",
+    ));
+    {
+        let only = ctx.session_only.clone();
+        session_toggle.connect_toggled(move |b| only.set(b.is_active()));
+    }
+    header.pack_end(&session_toggle);
     window.set_titlebar(Some(&header));
 
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 10);
@@ -865,6 +1177,7 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
         updating,
         existing,
         emit,
+        ctx,
         transient: RefCell::new(None),
     });
     UI.with(|u| *u.borrow_mut() = Some(ui.clone()));

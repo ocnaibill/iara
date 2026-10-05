@@ -1,7 +1,10 @@
 //! Testes contra o barramento de sessão real; sem barramento (CI sem D-Bus) eles se declaram ignorados e passam.
 use iara_core::edit::{self, EditCommand, MicSend, SendKind};
 use iara_core::{initial_profile, Gain, Profile};
-use iara_ipc::{serve, Client, ClientError, Controller, Server, State};
+use iara_ipc::{
+    serve, AppEntry, AppSource, AppState, Client, ClientError, Controller, Server, SessionChoice,
+    State,
+};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,6 +12,7 @@ use std::time::Duration;
 struct Fake {
     inner: Mutex<(Profile, u64)>,
     notifier: Mutex<Option<iara_ipc::Notifier>>,
+    sessions: Mutex<Vec<(String, SessionChoice)>>,
 }
 
 impl Controller for Fake {
@@ -21,7 +25,28 @@ impl Controller for Fake {
             persist_error: Some("disco cheio".into()),
             absent_devices: vec!["fone".into()],
             reconnect_attempts: 3,
+            apps: vec![AppEntry {
+                key: Some("bin:zen".into()),
+                display: "Zen".into(),
+                app_id: Some("app.zen_browser.zen".into()),
+                binary: Some("zen".into()),
+                name: None,
+                channel: Some("media".into()),
+                source: AppSource::Rule,
+                state: AppState::DontMove,
+                streams: 2,
+            }],
         })
+    }
+
+    fn session_choice(&self, key: String, choice: SessionChoice) -> Result<u64, String> {
+        if key.is_empty() {
+            return Err("chave vazia".into());
+        }
+        self.sessions.lock().unwrap().push((key, choice));
+        let mut g = self.inner.lock().unwrap();
+        g.1 += 1;
+        Ok(g.1)
     }
 
     fn edit(&self, cmd: EditCommand) -> Result<u64, String> {
@@ -58,6 +83,7 @@ fn start() -> Option<(String, Arc<Fake>, Server)> {
     let fake = Arc::new(Fake {
         inner: Mutex::new((initial_profile(), 1)),
         notifier: Mutex::new(None),
+        sessions: Mutex::new(Vec::new()),
     });
     let server = serve(&name, fake.clone()).expect("serve");
     *fake.notifier.lock().unwrap() = Some(server.notifier());
@@ -257,4 +283,39 @@ fn only_one_instance_can_own_the_name_and_a_missing_service_is_reported_as_unava
         ghost.edit(&EditCommand::SetMicGlobalMute(true)),
         Err(ClientError::Unavailable(_))
     ));
+}
+
+#[test]
+fn apps_travel_in_the_state_and_session_choices_reach_the_service() {
+    let Some((name, fake, _server)) = start() else {
+        return;
+    };
+    let client = Client::connect(name).unwrap();
+    let state = client.state().unwrap();
+    assert_eq!(
+        state.apps,
+        fake.state().unwrap().apps,
+        "a lista de aplicativos faz a viagem inteira"
+    );
+    assert_eq!(state.apps[0].identity().binary.as_deref(), Some("zen"));
+    client
+        .session_choice("bin:zen", &SessionChoice::Channel("game".into()))
+        .unwrap();
+    client
+        .session_choice("bin:zen", &SessionChoice::Unassigned)
+        .unwrap();
+    client
+        .session_choice("bin:zen", &SessionChoice::Clear)
+        .unwrap();
+    assert_eq!(
+        *fake.sessions.lock().unwrap(),
+        [
+            ("bin:zen".to_owned(), SessionChoice::Channel("game".into())),
+            ("bin:zen".to_owned(), SessionChoice::Unassigned),
+            ("bin:zen".to_owned(), SessionChoice::Clear),
+        ]
+    );
+    assert!(
+        matches!(client.session_choice("", &SessionChoice::Clear), Err(ClientError::Rejected(m)) if m.contains("vazia"))
+    );
 }

@@ -45,7 +45,7 @@ impl Mixer {
     }
 }
 
-type StateTuple = (u64, String, bool, String, Vec<String>, u32);
+type StateTuple = (u64, String, bool, String, Vec<String>, u32, String);
 
 pub(crate) fn state_to_tuple(s: &State) -> Result<StateTuple, String> {
     let toml = iara_store::profile_to_toml(&s.profile).map_err(|e| e.to_string())?;
@@ -56,12 +56,14 @@ pub(crate) fn state_to_tuple(s: &State) -> Result<StateTuple, String> {
         s.persist_error.clone().unwrap_or_default(),
         s.absent_devices.clone(),
         s.reconnect_attempts,
+        crate::apps_to_toml(&s.apps)?,
     ))
 }
 
 #[zbus::interface(name = "dev.iara.Mixer1")]
 impl Mixer {
-    /// (versão, perfil em TOML, conectado ao áudio, erro de gravação ("" = nenhum), dispositivos ausentes, tentativas de reconexão)
+    /// (versão, perfil em TOML, conectado ao áudio, erro de gravação ("" = nenhum), dispositivos ausentes, tentativas de reconexão,
+    /// aplicativos em TOML)
     fn get_state(&self) -> fdo::Result<StateTuple> {
         let s = self.controller.state().map_err(fdo::Error::Failed)?;
         state_to_tuple(&s).map_err(fdo::Error::Failed)
@@ -204,6 +206,24 @@ impl Mixer {
             },
             channel: opt(channel),
         })
+    }
+
+    /// Escolha só desta sessão para um aplicativo (chave de identidade): `channel` vazio = Não atribuídos. Não altera o perfil.
+    fn set_app_session(&self, key: String, channel: String) -> fdo::Result<u64> {
+        let choice = match opt(channel) {
+            Some(id) => crate::SessionChoice::Channel(id),
+            None => crate::SessionChoice::Unassigned,
+        };
+        self.controller
+            .session_choice(key, choice)
+            .map_err(fdo::Error::InvalidArgs)
+    }
+
+    /// Apaga a escolha temporária e reaplica a regra do perfil.
+    fn clear_app_session(&self, key: String) -> fdo::Result<u64> {
+        self.controller
+            .session_choice(key, crate::SessionChoice::Clear)
+            .map_err(fdo::Error::InvalidArgs)
     }
 
     /// O retrato mudou (perfil ou status); releia com `GetState`.

@@ -4,8 +4,7 @@
 //!
 //! As atualizações chegam por `on_update`, chamado nessas threads: quem usa deve levá-las à thread da interface.
 
-use crate::model::coalesce;
-use iara_core::edit::EditCommand;
+use crate::model::{coalesce_ui, UiCommand};
 use iara_ipc::{Client, ClientError, State, Subscription};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -26,12 +25,12 @@ const RETRY: Duration = Duration::from_secs(2);
 const LONG_WAIT: Duration = Duration::from_secs(3600);
 
 pub struct Backend {
-    tx: mpsc::Sender<EditCommand>,
+    tx: mpsc::Sender<UiCommand>,
 }
 
 impl Backend {
     pub fn spawn(bus_name: String, on_update: OnUpdate) -> Self {
-        let (tx, rx) = mpsc::channel::<EditCommand>();
+        let (tx, rx) = mpsc::channel::<UiCommand>();
         {
             let (name, cb) = (bus_name.clone(), on_update.clone());
             std::thread::spawn(move || watch(&name, &cb));
@@ -40,7 +39,7 @@ impl Backend {
         Self { tx }
     }
 
-    pub fn send(&self, cmd: EditCommand) {
+    pub fn send(&self, cmd: UiCommand) {
         let _ = self.tx.send(cmd);
     }
 }
@@ -79,12 +78,12 @@ fn follow(client: &Client, sub: &Subscription, on_update: &OnUpdate) -> bool {
     }
 }
 
-fn commands(name: &str, rx: mpsc::Receiver<EditCommand>, on_update: &OnUpdate) {
+fn commands(name: &str, rx: mpsc::Receiver<UiCommand>, on_update: &OnUpdate) {
     let mut client: Option<Client> = None;
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         batch.extend(rx.try_iter());
-        for cmd in coalesce(batch) {
+        for cmd in coalesce_ui(batch) {
             if client.is_none() {
                 client = Client::connect(name).ok();
             }
@@ -92,7 +91,11 @@ fn commands(name: &str, rx: mpsc::Receiver<EditCommand>, on_update: &OnUpdate) {
                 on_update(Update::Unavailable("sem barramento de sessão".into()));
                 continue;
             };
-            match c.edit(&cmd) {
+            let result = match &cmd {
+                UiCommand::Edit(e) => c.edit(e),
+                UiCommand::Session { key, choice } => c.session_choice(key, choice),
+            };
+            match result {
                 Ok(_) => {}
                 Err(ClientError::Rejected(m)) => on_update(Update::Rejected(m)),
                 Err(ClientError::Unavailable(m)) => {

@@ -10,23 +10,7 @@ use std::collections::{HashMap, HashSet};
 /// Escolhas temporárias desta sessão: chave do aplicativo → `Some(canal)` ou `None` (Não atribuídos).
 pub type Overrides = HashMap<String, Option<String>>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AppState {
-    Applied,
-    Applying,
-    /// Parte dos fluxos aplicada, parte não.
-    Partial,
-    /// Pedimos a mudança e o fluxo não foi para o destino.
-    NotApplied,
-    /// O fluxo está noutro canal do Iara (alguém o moveu depois): respeitado, sem briga.
-    Elsewhere,
-    /// O fluxo declara que não aceita ser movido (`node.dont-move`).
-    DontMove,
-    /// Há regra salva, mas o aplicativo não está tocando: não é recusa (spec 8.11).
-    Waiting,
-    /// Sem identificação utilizável: o produto pede seleção em vez de adivinhar.
-    Unmanaged,
-}
+pub use iara_ipc::AppState;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppView {

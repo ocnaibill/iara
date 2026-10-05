@@ -286,6 +286,31 @@ barramento (`ServiceUnknown`, `NoReply`…) são classificados no cliente como "
 
 Limites: medidores de nível não passam pelo IPC (spec 6.4); o serviço ainda não faz troca de perfil nem associação de aplicativos; a janela GTK ainda não usa o cliente.
 
+## Prova 14 e 15 — aplicativos: inventário, regras, roteamento e janela
+
+Scripts: `tools/provas/14-roteamento-e2e.sh` (motor sozinho) e `tools/provas/15-aplicativos-ao-vivo.sh` (serviço + motor + D-Bus + janela).
+Só fluxos de teste `IaraTeste*` (pw-play, tom baixo) são movidos; os aplicativos do usuário aparecem como Não atribuídos e não são tocados.
+
+| Etapa | Resultado (links reais no PipeWire) |
+| --- | --- |
+| Sem regras | A, B e C na saída física |
+| `AssignApp` A→game, B→media, C→chat | A→`iara.ch.game`, B→`iara.ch.media`; C (`node.dont-move`) fica na saída física, estado "não aceita ser movido" |
+| `SetAppSession` A→chat (só esta sessão) | A→`iara.ch.chat`; **o perfil não muda** (regra de A segue `game`) |
+| `RemoveChannel media` com destino `game` | regra de B passa a `game` e o fluxo de B acompanha; as demais regras intactas |
+| Mudança externa (pw-metadata) em B | o motor **não briga**; estado "não aplicado/em outro canal" |
+| Desassociar A (volta a Não atribuídos) | a sobreposição do Iara é removida e A volta ao padrão do sistema |
+| Serviço encerra | os fluxos de teste voltam à saída física |
+
+Achados: (1) as propriedades do anúncio no registro não bastam: `node.dont-move` e parte da identidade só aparecem na informação completa do nó, então
+cada fluxo tem um listener de `info` (só aplica eventos que trazem propriedades e nunca apaga um campo por omissão); (2) a chave do aplicativo muda de
+`name:` para `bin:` quando a identidade completa chega, então rotas e escolhas de sessão são recalculadas a cada relatório; (3) aplicativos em sandbox
+expõem `pipewire.access.portal.app_id` (ex.: `app.zen_browser.zen`), melhor identidade que o binário e usada como id do aplicativo.
+A decisão de roteamento é pura (`iara-audio::routing`, 6 testes): move uma vez por destino desejado, respeita `dont-move`, só considera "aplicado" com o link real
+no destino e não briga com mudanças externas.
+
+Limites: arrastar e soltar e o menu "Mover para…" **não foram exercitados com entrada real** (só compilados e vistos em captura); unassigned só é capturado
+quando a saída padrão do sistema for a do Iara (issue #9); aplicativo com identidade só por `name` pode trocar de chave durante a vida do fluxo.
+
 ### O que isto NÃO prova
 
 - Medições longas (horas), CPU com medidores de nível ativos e com efeitos; o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.

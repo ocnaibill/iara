@@ -1,9 +1,11 @@
 //! Liga o serviço ao IPC: o `Controller` do D-Bus envia mensagens ao laço do serviço e espera a resposta com prazo.
 //! O estado continua sendo só do serviço; o IPC nunca o toca diretamente.
 
+use crate::apps::AppView;
 use crate::service::{Command, Msg, Snapshot};
+use iara_core::apps::Source;
 use iara_core::edit::EditCommand;
-use iara_ipc::{Controller, State};
+use iara_ipc::{AppEntry, AppSource, Controller, SessionChoice, State};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -20,8 +22,27 @@ impl ServiceController {
     }
 }
 
+fn entry(a: AppView) -> AppEntry {
+    AppEntry {
+        key: a.key,
+        display: a.display,
+        app_id: a.identity.app_id,
+        binary: a.identity.binary,
+        name: a.identity.name,
+        channel: a.channel,
+        source: match a.source {
+            Source::SessionOverride => AppSource::Session,
+            Source::Rule => AppSource::Rule,
+            Source::Default => AppSource::Default,
+        },
+        state: a.state,
+        streams: u32::try_from(a.streams).unwrap_or(u32::MAX),
+    }
+}
+
 pub fn to_state(s: Snapshot) -> State {
     State {
+        apps: s.apps.into_iter().map(entry).collect(),
         serial: s.serial,
         profile: s.profile,
         connected: s.status.connected,
@@ -40,6 +61,19 @@ impl Controller for ServiceController {
         rx.recv_timeout(REPLY_TIMEOUT)
             .map(to_state)
             .map_err(|_| "o serviço não respondeu a tempo".to_owned())
+    }
+
+    fn session_choice(&self, key: String, choice: SessionChoice) -> Result<u64, String> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Msg::Command(Command::SessionChoice {
+                key,
+                choice,
+                reply: Some(reply),
+            }))
+            .map_err(|_| "serviço encerrando".to_owned())?;
+        rx.recv_timeout(REPLY_TIMEOUT)
+            .map_err(|_| "o serviço não respondeu a tempo".to_owned())?
     }
 
     fn edit(&self, cmd: EditCommand) -> Result<u64, String> {

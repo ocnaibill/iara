@@ -90,14 +90,16 @@ impl Client {
     }
 
     pub fn state(&self) -> Result<State, ClientError> {
-        let (serial, toml, connected, persist_error, absent_devices, reconnect_attempts): (
+        let (serial, toml, connected, persist_error, absent_devices, reconnect_attempts, apps): (
             u64,
             String,
             bool,
             String,
             Vec<String>,
             u32,
+            String,
         ) = self.proxy.call("GetState", &())?;
+        let apps = crate::apps_from_toml(&apps).map_err(ClientError::Rejected)?;
         let profile = iara_store::profile_from_toml(&toml)
             .map_err(|e| ClientError::Rejected(e.to_string()))?;
         Ok(State {
@@ -107,6 +109,7 @@ impl Client {
             persist_error: (!persist_error.is_empty()).then_some(persist_error),
             absent_devices,
             reconnect_attempts,
+            apps,
         })
     }
 
@@ -176,6 +179,20 @@ impl Client {
             )?,
         };
         Ok(serial)
+    }
+
+    /// Escolha só desta sessão para um aplicativo; devolve a nova versão do estado.
+    pub fn session_choice(
+        &self,
+        key: &str,
+        choice: &crate::SessionChoice,
+    ) -> Result<u64, ClientError> {
+        let p = &self.proxy;
+        Ok(match choice {
+            crate::SessionChoice::Channel(id) => p.call("SetAppSession", &(key, id.as_str()))?,
+            crate::SessionChoice::Unassigned => p.call("SetAppSession", &(key, ""))?,
+            crate::SessionChoice::Clear => p.call("ClearAppSession", &(key,))?,
+        })
     }
 
     /// Assina o sinal `Changed`. Crie a assinatura ANTES de agir se não puder perder avisos; ela vive até o fim do processo

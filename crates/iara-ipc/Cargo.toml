@@ -8,3 +8,5 @@ license.workspace = true
 iara-core.workspace = true
 iara-store = { path = "../iara-store" }
 zbus = "5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"

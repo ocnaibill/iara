@@ -51,15 +51,7 @@ pub struct Snapshot {
     pub apps: Vec<AppView>,
 }
 
-/// Escolha temporária (só nesta sessão) para um aplicativo; some quando ele para de tocar, ao trocar de perfil ou ao
-/// reaplicar a regra (spec 8.9).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionChoice {
-    Channel(String),
-    Unassigned,
-    /// Reaplica a regra do perfil (apaga a escolha temporária).
-    Clear,
-}
+pub use iara_ipc::SessionChoice;
 
 pub enum Command {
     /// Edição granular do perfil ativo (a forma normal de a interface mudar o estado): responde com a nova versão ou o erro.
