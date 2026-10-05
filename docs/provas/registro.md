@@ -154,9 +154,12 @@ a saída física do fifine. Resultado após 4 s de ausência e 6 s após o retor
 - Consequência: nem o loopback com fallback (troca indevida de dispositivo, proibida pelas specs 8.5/8.6) nem o sem fallback (some e não volta)
   atendem sozinhos. O serviço precisa ser dono do ciclo: manter os nós virtuais estáveis (silêncio sem origem), observar o registro
   e **recriar** o par de streams quando o dispositivo preferido voltar, com a geração da escolha (8.5).
-- Efeito na sessão do usuário durante o teste: o stream de captura do Zen caiu para a C922 quando o fifine sumiu e não voltou; foi
-  devolvido ao fifine por metadata (uma chave `target.object` do Zen permanece no daemon até o próximo reinício do PipeWire).
-  Uma limpeza minha apagou essa chave uma vez por engano e ela foi regravada. O perfil do fifine foi restaurado ao original.
+- Efeito na sessão do usuário durante o teste: o stream de captura do Zen terminou na C922 depois da ausência do fifine. A causa **não está
+  estabelecida**: pode ter sido o fallback do WirePlumber, o navegador reagindo à remoção do dispositivo, ou o próprio usuário trocando o microfone
+  no Google Meet na mesma hora (o usuário relatou essa possibilidade). O que está medido é só o comportamento dos loopbacks de teste e da fonte padrão.
+  Por precaução o Zen foi movido ao fifine por metadata (uma chave `target.object` do Zen permanece no daemon até o próximo reinício do PipeWire);
+  isso pode ter sobrescrito uma escolha deliberada do usuário. Uma limpeza minha apagou essa chave uma vez por engano e ela foi regravada.
+  O perfil do fifine foi restaurado ao original.
 
 ### O que isto NÃO prova
 
