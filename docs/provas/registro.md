@@ -161,9 +161,44 @@ a saída física do fifine. Resultado após 4 s de ausência e 6 s após o retor
   isso pode ter sobrescrito uma escolha deliberada do usuário. Uma limpeza minha apagou essa chave uma vez por engano e ela foi regravada.
   O perfil do fifine foi restaurado ao original.
 
+## Prova 06 — latência, CPU, RAM e xruns (passo 8)
+
+Scripts: `tools/provas/06a-latencia.sh`, `06b-recursos.sh`. PipeWire 1.6.9, `clock.rate=48000`, `clock.quantum=1024`
+(21,3 ms por ciclo), grafo guiado pelo driver ALC887 da sessão do usuário, que seguia com Zen e Cider ativos (ruído de base).
+
+**06a — latência de um clique entre sinks de uma cadeia de loopbacks hospedados no processo Rust (5 repetições por caminho)**
+
+| Caminho | Atraso (ms) |
+| --- | --- |
+| Controle positivo: loopback com `-d 0,05` s | 50,0 / 50,0 / 50,0 / 50,0 / 50,0 |
+| canal → mix (1 loopback) | 0,0 em todas |
+| canal → MASTER (2 em série) | 0,0 em todas |
+| MIC → fonte para aplicativos (2 em série) | 0,0 em todas |
+| MIC → MASTER de transmissão (3 em série) | 0,0 em todas |
+
+Método: dois taps simétricos copiam a origem para FL e o fim do caminho para FR de um sink estéreo; o atraso é a diferença entre
+os picos (resolução de 1 amostra ≈ 0,02 ms). O controle de 50 ms foi lido corretamente, então a ferramenta enxerga atrasos.
+Leitura: neste grafo (um único driver, nós ligados) os estágios de loopback não adicionam atraso mensurável entre sinks.
+Isto **não** inclui a latência de saída do dispositivo físico, nem o comportamento com outro quantum (aplicativos que pedem quantum
+menor/maior) ou com Bluetooth.
+
+**06b — recursos com a topologia completa da prova 02 (11 loopbacks no processo Rust, 54 nós no grafo)**
+
+| Estado | CPU pipewire | CPU wireplumber | CPU sonda | RSS pipewire | RSS sonda |
+| --- | --- | --- | --- | --- | --- |
+| Base (sem topologia, 15 s) | 1,2 % | 0,0 % | — | 31,3 MiB | — |
+| Topologia ociosa (20 s) | 2,0 % | 0,1 % | 1,0 % | 115,6 MiB | 24,2 MiB |
+| 3 tons ativos (20 s) | 1,6 % | 0,0 % | 0,6 % | 125,5 MiB | 24,4 MiB |
+
+- CPU em % de um núcleo, de janelas de 20 s (contadores de `/proc`); xruns (`pw-top`, coluna ERR cumulativa): **0** nos 32 nós do Iara e
+  no driver principal, nessas janelas curtas.
+- RSS do `pipewire` sobe ~85–95 MiB com a topologia (≈1,7 MiB por nó, a investigar se os buffers são dimensionáveis) e **volta a 31,5 MiB**
+  depois da remoção (pico 123,5 MiB): sem vazamento observado.
+- Sem metas numéricas definidas; estes são os números de partida para a spec 10.
+
 ### O que isto NÃO prova
 
-- Passo 8 (CPU, RAM, latência, xruns) e o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.
-- Microfone físico real (a prova 02 usa um sink nulo como fonte simulada); latência acumulada dos estágios encadeados (até 3 loopbacks em série no caminho do MIC) não foi medida.
+- Medições longas (horas), CPU com medidores de nível ativos e com efeitos; o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.
+- Microfone físico real (a prova 02 usa um sink nulo como fonte simulada).
 - Provas 01–02 usaram `pw-loopback`/`pw-cli`; a 03 usa um processo Rust, mas só no contexto cliente. Hospedagem no daemon (módulo em `pipewire.conf.d`) não foi testada e a decisão de hospedagem segue aberta.
 - A diferença de ~0,2 dB entre o RMS esperado (−9,03) e o medido (−9,25) na base não foi investigada.
