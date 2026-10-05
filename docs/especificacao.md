@@ -163,6 +163,10 @@ Bindings Rust: avaliar candidatos pela API necessária (registry, metadata, link
 
 Medido (docs/provas/registro.md, prova 03): o WirePlumber 0.5.18 persiste volume e mute de sinks e streams e os restaura quando o nó reaparece, podendo contaminar a execução seguinte. Decisão: todo nó criado pelo Iara declara `state.restore-props=false` e `state.restore-target=false` (função única de montagem de propriedades, com teste que impede criar nó sem o opt-out) e o serviço aplica explicitamente ganho e mute do perfil quando o nó aparece no registro. Não se desliga a restauração globalmente nem se altera a configuração do WirePlumber do usuário. Pendente: confirmar se o WirePlumber ainda grava entradas para nós com opt-out.
 
+#### 6.3.1.2 Hospedagem: decisão
+
+Confirmado: os objetos de áudio do Iara (sinks, loopbacks/streams, fontes virtuais) ficam no contexto PipeWire do serviço, sem módulos no daemon e sem `object.linger`. Fechar a janela mantém o serviço em segundo plano. Desligar o serviço é ação deliberada do usuário e derruba os canais; a ação “Desligar mixer / voltar ao áudio normal” restaura o destino padrão anterior. Queda inesperada do serviço ou reinício do PipeWire não têm promessa de áudio contínuo: os fluxos caem na saída física (medido, prova 04) e o serviço, ao voltar, reconecta, recria seus objetos sem duplicar e reencaminha os fluxos por metadata. Requisitos derivados: ouvir o erro do core, invalidar referências, reconstruir a partir do estado desejado e, por segurança, remover na inicialização qualquer objeto próprio remanescente (marcado por propriedade própria).
+
 #### 6.3.2 Prova mínima e critérios de saída
 
 1. Numa sessão Linux real com PipeWire/WirePlumber, criar um canal e dois destinos capturáveis independentes. Gerar sinal conhecido e registrar rate/quantum/formato.
@@ -448,3 +452,4 @@ Consultadas em 05/10/2026. Fundamentam capacidades existentes; os comportamentos
 - **0.9 — 05/10/2026:** decisões documentais fechadas (ganho, ChatMix, histórico, TOML, MIT); protocolo verificável de provas técnicas; esqueleto Cargo separado do backend ainda não validado.
 
 - **0.10 — 05/10/2026:** provas 01–03 executadas e registradas; opt-out da restauração de estado do WirePlumber para nós do Iara; restauração do WirePlumber tratada como aplicativo novo (regra aplicada uma vez, depois respeita mudanças externas).
+- **0.10.1 — 05/10/2026:** hospedagem decidida: tudo no processo do serviço; fechar a janela mantém o serviço; desligar o serviço é decisão consciente do usuário (6.3.1.2).
