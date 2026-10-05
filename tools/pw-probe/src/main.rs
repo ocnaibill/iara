@@ -109,6 +109,27 @@ fn main() {
                     eprintln!("loop {name}: falha ao carregar o módulo");
                 }
             }
+            ["lpx", name, cap, is_sink, play, fallback] => {
+                // loopback com nomes de nó crus (dispositivos físicos); fallback = "fb" permite fallback do WirePlumber
+                let nf = if *fallback == "fb" { "" } else { "node.dont-fallback=true" };
+                let args = format!(
+                    "{{ audio.position=[FL FR] node.name=iara_probe_{name} \
+                     capture.props={{ node.name=iara_probe_{name}_in target.object={cap} stream.capture.sink={is_sink} node.passive=true {nf} state.restore-props=false state.restore-target=false }} \
+                     playback.props={{ node.name=iara_probe_{name}_out target.object={play} {nf} state.restore-props=false state.restore-target=false }} }}"
+                );
+                let a = CString::new(args).unwrap();
+                let m = unsafe {
+                    pw::sys::pw_context_load_module(
+                        ctx.as_raw_ptr(),
+                        c"libpipewire-module-loopback".as_ptr(),
+                        a.as_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if m.is_null() {
+                    eprintln!("lpx {name}: falha ao carregar o módulo");
+                }
+            }
             ["vol", node, lin] => {
                 let v: f32 = lin.parse().unwrap_or(1.0);
                 let bytes = props_pod(

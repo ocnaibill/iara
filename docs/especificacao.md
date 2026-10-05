@@ -167,6 +167,10 @@ Medido (docs/provas/registro.md, prova 03): o WirePlumber 0.5.18 persiste volume
 
 Confirmado: os objetos de áudio do Iara (sinks, loopbacks/streams, fontes virtuais) ficam no contexto PipeWire do serviço, sem módulos no daemon e sem `object.linger`. Fechar a janela mantém o serviço em segundo plano. Desligar o serviço é ação deliberada do usuário e derruba os canais; a ação “Desligar mixer / voltar ao áudio normal” restaura o destino padrão anterior. Queda inesperada do serviço ou reinício do PipeWire não têm promessa de áudio contínuo: os fluxos caem na saída física (medido, prova 04) e o serviço, ao voltar, reconecta, recria seus objetos sem duplicar e reencaminha os fluxos por metadata. Requisitos derivados: ouvir o erro do core, invalidar referências, reconstruir a partir do estado desejado e, por segurança, remover na inicialização qualquer objeto próprio remanescente (marcado por propriedade própria).
 
+#### 6.3.1.3 Dispositivos físicos ausentes
+
+Medido (prova 05b): um loopback com `node.dont-fallback` é descarregado quando o dispositivo some e não volta sozinho; sem a propriedade, o WirePlumber move o fluxo para outro dispositivo (microfone da webcam, caixas) e depois o devolve. Decisão de projeto: o serviço é dono do ciclo dos streams que tocam em dispositivos físicos. Os nós virtuais (mixes, fonte do MIC) permanecem e fornecem silêncio; os streams para o dispositivo físico são criados com `node.dont-fallback`, removidos na ausência e recriados quando o dispositivo preferido volta, respeitando a geração da escolha (8.5/8.6). Nenhum fluxo do Iara deve usar fallback automático do WirePlumber para dispositivo não autorizado.
+
 #### 6.3.2 Prova mínima e critérios de saída
 
 1. Numa sessão Linux real com PipeWire/WirePlumber, criar um canal e dois destinos capturáveis independentes. Gerar sinal conhecido e registrar rate/quantum/formato.
@@ -453,3 +457,4 @@ Consultadas em 05/10/2026. Fundamentam capacidades existentes; os comportamentos
 
 - **0.10 — 05/10/2026:** provas 01–03 executadas e registradas; opt-out da restauração de estado do WirePlumber para nós do Iara; restauração do WirePlumber tratada como aplicativo novo (regra aplicada uma vez, depois respeita mudanças externas).
 - **0.10.1 — 05/10/2026:** hospedagem decidida: tudo no processo do serviço; fechar a janela mantém o serviço; desligar o serviço é decisão consciente do usuário (6.3.1.2).
+- **0.10.2 — 05/10/2026:** provas 04–05 registradas; ciclo de vida dos streams de dispositivos físicos fica sob controle do serviço (6.3.1.3).

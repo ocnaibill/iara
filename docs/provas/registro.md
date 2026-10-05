@@ -116,9 +116,51 @@ sozinho** quando o nó reaparece; o serviço precisa reencaminhar por metadata a
 - Os ramos com ganho (loopbacks) vivem no processo cliente e não têm equivalente com linger nesta prova. Hospedar tudo no
   daemon por `pipewire.conf.d` **não foi testado** (exigiria reinícios extras e não permite canais dinâmicos sem recarregar).
 
+## Prova 05 — mover aplicativos e ausência de dispositivo físico
+
+Scripts: `tools/provas/05a-mover-aplicativos.sh`, `05b-ausencia-dispositivo.sh`, `lib_links.py` (sonda `tools/pw-probe`, comando `lpx`).
+
+**05a — mover por metadata (streams `pw-play` de teste)**
+
+| Caso | Resultado |
+| --- | --- |
+| A (sem destino): `pw-metadata … target.object=<nome do sink>` | moveu para o sink do Iara |
+| B com `node.dont-move=true` | **não moveu**; a propriedade é visível no nó antes da tentativa (detectável) |
+| C com destino explícito na saída física (`--target`) | moveu (metadata vence o destino explícito do stream) |
+| Mudança externa em A com `pw-metadata` | A voltou à saída física; um observador independente (`pw-metadata -m`) viu `update id:<A> key:'target.object'` com o nome |
+| Mudança externa com `pactl move-sink-input` (protocolo Pulse) | A moveu; o observador viu `target.node=<id do nó>` e `target.object=<serial numérico>` (formato diferente do nosso, que é o nome) |
+
+Leitura: movimentos externos são observáveis como eventos de metadata cujo sujeito é o id do stream; escritas próprias
+são reconhecíveis por quem as fez. Não se mediu a política de aplicativos que ignoram metadata sem `dont-move`.
+Não explicado: na segunda execução o stream A já nasceu ligado ao sink do Iara, sem pedido. Hipótese não confirmada:
+restauração de destino do WirePlumber ou metadata remanescente; o arquivo de estado não contém entrada para A.
+Da leitura de `state-stream.lua` (não medido): o WirePlumber grava o destino ao ver `target.object` mudar quando ele
+resolve o nó pelo **serial numérico** (caso do `pactl`/seletores do desktop), e a escrita por nome (a nossa) não o resolve.
+
+**05b — ausência e retorno do fifine AM8 Pro (perfil de placa desligado e religado por software)**
+
+Quatro loopbacks (`nofb` = com `node.dont-fallback`; `fb` = sem) do microfone físico para um sink do Iara e de um sink do Iara para
+a saída física do fifine. Resultado após 4 s de ausência e 6 s após o retorno (1 execução):
+
+| Variante | Ausente | Após o retorno |
+| --- | --- | --- |
+| Entrada `nofb` | nó do loopback **sumiu** do grafo (sem fallback) | **não voltou** (continua ausente) |
+| Entrada `fb` | **caiu para outro microfone** (webcam C922) | voltou ao fifine sozinha |
+| Saída `nofb` | nó do loopback sumiu (sem fallback para as caixas) | **não voltou** |
+| Saída `fb` | **caiu para as caixas (ALC887)** | voltou ao fifine sozinha |
+
+- Fonte padrão do sistema: mudou para a C922 durante a ausência e voltou para o fifine sozinha.
+- O módulo loopback encerra o par de streams quando o destino/origem some com `dont-fallback`; o processo cliente seguiu vivo.
+- Consequência: nem o loopback com fallback (troca indevida de dispositivo, proibida pelas specs 8.5/8.6) nem o sem fallback (some e não volta)
+  atendem sozinhos. O serviço precisa ser dono do ciclo: manter os nós virtuais estáveis (silêncio sem origem), observar o registro
+  e **recriar** o par de streams quando o dispositivo preferido voltar, com a geração da escolha (8.5).
+- Efeito na sessão do usuário durante o teste: o stream de captura do Zen caiu para a C922 quando o fifine sumiu e não voltou; foi
+  devolvido ao fifine por metadata (uma chave `target.object` do Zen permanece no daemon até o próximo reinício do PipeWire).
+  Uma limpeza minha apagou essa chave uma vez por engano e ela foi regravada. O perfil do fifine foi restaurado ao original.
+
 ### O que isto NÃO prova
 
-- Passos 5, 7 e 8: clientes de captura reais, ausência/reconexão da entrada física e da saída física, política externa e `dont-move`, CPU/RAM/latência/xruns; tempo de indisponibilidade após reinício do PipeWire.
+- Passo 8 (CPU, RAM, latência, xruns) e o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.
 - Microfone físico real (a prova 02 usa um sink nulo como fonte simulada); latência acumulada dos estágios encadeados (até 3 loopbacks em série no caminho do MIC) não foi medida.
 - Provas 01–02 usaram `pw-loopback`/`pw-cli`; a 03 usa um processo Rust, mas só no contexto cliente. Hospedagem no daemon (módulo em `pipewire.conf.d`) não foi testada e a decisão de hospedagem segue aberta.
 - A diferença de ~0,2 dB entre o RMS esperado (−9,03) e o medido (−9,25) na base não foi investigada.
