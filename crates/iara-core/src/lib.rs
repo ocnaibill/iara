@@ -1,5 +1,6 @@
 //! Domínio compartilhado; sem dependência de GTK, PipeWire ou IPC.
 
+pub mod edit;
 pub mod topology;
 
 pub const HISTORY_LIMIT: usize = 50;
@@ -34,6 +35,15 @@ impl Gain {
             return Err("ganho deve ser finito e estar entre -60 e 0 dB");
         }
         Ok(Self(Some(db)))
+    }
+
+    /// Entrada de interfaces externas: `-inf` é o silêncio exato; qualquer outro valor segue `from_db`.
+    pub fn from_db_or_silence(db: f64) -> Result<Self, &'static str> {
+        if db == f64::NEG_INFINITY {
+            Ok(Self::SILENCE)
+        } else {
+            Self::from_db(db)
+        }
     }
 
     pub fn db(self) -> Option<f64> {
