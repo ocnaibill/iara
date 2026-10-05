@@ -3,6 +3,22 @@
 pub mod topology;
 
 pub const HISTORY_LIMIT: usize = 50;
+
+/// Ids lógicos (perfil, canal) viram nomes de arquivo e de nó do PipeWire: só `[a-z0-9_-]`, 1 a 32 caracteres,
+/// começando por letra ou dígito. Perfis importados são entrada não confiável.
+pub fn is_valid_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    id.len() <= 32
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// Chave de dispositivo/texto livre: sem caracteres de controle e de tamanho razoável.
+pub fn is_valid_text(text: &str, max_len: usize) -> bool {
+    !text.is_empty() && text.len() <= max_len && !text.chars().any(char::is_control)
+}
 pub const SPEC_VERSION: &str = "0.10";
 
 /// Ganho digital de amplitude; None representa silêncio (-infinito dB).
@@ -199,6 +215,29 @@ mod tests {
         assert_eq!(mic.effective_amplitudes(), [0.1, 0.0, 1.0]);
         mic.global_mute = true;
         assert_eq!(mic.effective_amplitudes(), [0.0; 3]);
+    }
+
+    #[test]
+    fn ids_are_restricted_to_a_safe_alphabet() {
+        for ok in ["game", "a", "chat-2", "x_y", "0abc"] {
+            assert!(is_valid_id(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "-a",
+            "_a",
+            "A",
+            "a b",
+            "a/b",
+            "..",
+            "a\"b",
+            "ç",
+            &"a".repeat(33),
+        ] {
+            assert!(!is_valid_id(bad), "{bad}");
+        }
+        assert!(is_valid_text("alsa_output.pci-0000", 64));
+        assert!(!is_valid_text("a\nb", 64) && !is_valid_text("", 64) && !is_valid_text("abc", 2));
     }
 
     #[test]

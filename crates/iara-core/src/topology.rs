@@ -5,7 +5,7 @@
 //! ganho/mute comuns e três ramos (aplicativos, pessoal, transmissão). Envio desabilitado não gera ramo; mute
 //! mantém o ramo (preserva ganho e permite desmutar sem recriar).
 
-use crate::{chatmix, Profile};
+use crate::{chatmix, is_valid_id, is_valid_text, Profile};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const NODE_PREFIX: &str = "iara.";
@@ -91,6 +91,8 @@ pub struct Plan {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PlanError {
+    InvalidId(String),
+    InvalidDeviceKey,
     DuplicateChannel(String),
     UnknownChatMixChannel(String),
     InvalidChatMix,
@@ -109,7 +111,21 @@ fn branch(from: &str, to: &str, volume: f64, muted: bool) -> BranchSpec {
 
 pub fn plan(profile: &Profile) -> Result<Plan, PlanError> {
     let mut seen = BTreeSet::new();
+    if !is_valid_id(&profile.id) {
+        return Err(PlanError::InvalidId(profile.id.clone()));
+    }
+    for d in [&profile.preferred_output, &profile.preferred_microphone]
+        .into_iter()
+        .flatten()
+    {
+        if !is_valid_text(&d.persistent_key, 256) {
+            return Err(PlanError::InvalidDeviceKey);
+        }
+    }
     for c in &profile.channels {
+        if !is_valid_id(&c.id) {
+            return Err(PlanError::InvalidId(c.id.clone()));
+        }
         if !seen.insert(c.id.as_str()) {
             return Err(PlanError::DuplicateChannel(c.id.clone()));
         }
@@ -508,6 +524,14 @@ mod tests {
             plan(&profile),
             Err(PlanError::DuplicateChannel("game".into()))
         );
+        let mut profile = initial_profile();
+        profile.channels[0].id = "x\" }} evil=1 {{ \"".into();
+        assert!(matches!(plan(&profile), Err(PlanError::InvalidId(_))));
+        let mut profile = initial_profile();
+        profile.preferred_output = Some(crate::DevicePreference {
+            persistent_key: "a\"b\nc".into(),
+        });
+        assert_eq!(plan(&profile), Err(PlanError::InvalidDeviceKey));
         let mut profile = initial_profile();
         profile.chatmix.channels = Some(("game".into(), "nao-existe".into()));
         assert_eq!(

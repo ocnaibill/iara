@@ -255,15 +255,21 @@ fn node_props(spec: &NodeSpec) -> pw::properties::PropertiesBox {
     }
 }
 
+/// Valor entre aspas em SPA-JSON: escapa `\` e `"` (os ids e chaves já são validados no core; defesa em profundidade).
+fn q(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Loopback entre dois nós. `from_is_sink`: lê o monitor de um sink (barramentos do Iara, saída) em vez de uma fonte.
 /// Sempre `node.dont-fallback`: o WirePlumber nunca troca o alvo por outro dispositivo (spec 8.5/8.6).
 fn link_args(name: &str, from: &str, from_is_sink: bool, to: &str) -> String {
+    let (name, from, to) = (q(name), q(from), q(to));
     format!(
         "{{ audio.position=[FL FR] node.name=\"{name}\" \
          capture.props={{ node.name=\"{inn}\" target.object=\"{from}\" stream.capture.sink={from_is_sink} node.passive=true node.dont-fallback=true {c} }} \
          playback.props={{ node.name=\"{out}\" target.object=\"{to}\" node.dont-fallback=true {c} }} }}",
-        inn = in_name(name),
-        out = out_name(name),
+        inn = in_name(&name),
+        out = out_name(&name),
         c = COMMON_PROPS,
     )
 }
