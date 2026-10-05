@@ -2,12 +2,14 @@
 //! comandos e eventos do motor num único canal, acordando só para os prazos (autosave, fechamento de gesto, reconexão).
 //! O tempo entra por parâmetro (`handle`, `tick`) para testar sem dormir; `run` liga ao relógio real.
 
+use crate::apps::{self, AppView, Overrides};
 use crate::tracker::{Action, EditKind, EditTracker};
-use iara_audio::{ApplyReport, Engine, EngineError, Event, EventSink};
+use iara_audio::{AppReport, ApplyReport, Engine, EngineError, Event, EventSink, RouteTarget};
 use iara_core::edit::{self, EditClass, EditCommand};
 use iara_core::topology::{plan, Plan};
 use iara_core::{initial_profile, Profile};
 use iara_store::{GlobalConfig, RevisionReason, Store, StoreError};
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -22,11 +24,17 @@ const BACKOFF: [Duration; 5] = [
 
 pub trait Backend {
     fn apply(&mut self, plan: Plan) -> Result<ApplyReport, EngineError>;
+    /// Para onde cada aplicativo (chave de identidade) deve ir; o resultado volta como `Event::Apps`.
+    fn set_routes(&mut self, routes: HashMap<String, RouteTarget>) -> Result<(), EngineError>;
 }
 
 impl Backend for Engine {
     fn apply(&mut self, plan: Plan) -> Result<ApplyReport, EngineError> {
         Engine::apply(self, plan)
+    }
+
+    fn set_routes(&mut self, routes: HashMap<String, RouteTarget>) -> Result<(), EngineError> {
+        Engine::set_routes(self, routes)
     }
 }
 
@@ -39,6 +47,18 @@ pub struct Snapshot {
     pub serial: u64,
     pub profile: Profile,
     pub status: Status,
+    /// Aplicativos para a interface: tocando agora (com estado real) e com regra salva mas em silêncio.
+    pub apps: Vec<AppView>,
+}
+
+/// Escolha temporária (só nesta sessão) para um aplicativo; some quando ele para de tocar, ao trocar de perfil ou ao
+/// reaplicar a regra (spec 8.9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionChoice {
+    Channel(String),
+    Unassigned,
+    /// Reaplica a regra do perfil (apaga a escolha temporária).
+    Clear,
 }
 
 pub enum Command {
@@ -50,6 +70,12 @@ pub enum Command {
     /// Retrato atual do estado.
     GetState {
         reply: Reply<Snapshot>,
+    },
+    /// Escolha temporária de canal para um aplicativo (chave de identidade), sem alterar o perfil.
+    SessionChoice {
+        key: String,
+        choice: SessionChoice,
+        reply: Option<Reply<Result<u64, String>>>,
     },
     /// Substituição do perfil inteiro (importação, restauração de revisão, reset) e o tipo de edição para o histórico.
     SetProfile {
@@ -97,6 +123,8 @@ pub struct Status {
     pub last_report: Option<ApplyReport>,
     pub absent_devices: Vec<String>,
     pub reconnect_attempts: u32,
+    /// Último relatório de aplicativos do motor (fluxos agrupados por aplicativo).
+    pub apps: Vec<AppReport>,
 }
 
 pub struct Service<B: Backend> {
@@ -111,6 +139,8 @@ pub struct Service<B: Backend> {
     stopped: bool,
     serial: u64,
     notifier: Option<Box<dyn Fn(u64)>>,
+    overrides: Overrides,
+    last_routes: Option<HashMap<String, RouteTarget>>,
 }
 
 /// Perfil ativo da configuração; sem nenhum, usa o primeiro existente ou cria o padrão. Nunca sobrescreve um perfil
@@ -160,6 +190,8 @@ impl<B: Backend> Service<B> {
             stopped: false,
             serial: 1,
             notifier: None,
+            overrides: Overrides::new(),
+            last_routes: None,
         })
     }
 
@@ -173,6 +205,23 @@ impl<B: Backend> Service<B> {
             serial: self.serial,
             profile: self.profile.clone(),
             status: self.status.clone(),
+            apps: apps::views(&self.profile, &self.overrides, &self.status.apps),
+        }
+    }
+
+    /// Manda o plano de rotas ao motor quando ele mudou (ou sempre, com `force`, ao reconectar).
+    fn sync_routes(&mut self, force: bool, now: Instant) {
+        let plan = apps::route_plan(&self.profile, &self.overrides, &self.status.apps);
+        if !force && self.last_routes.as_ref() == Some(&plan) {
+            return;
+        }
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        match backend.set_routes(plan.clone()) {
+            Ok(()) => self.last_routes = Some(plan),
+            Err(EngineError::Disconnected) => self.drop_backend(now),
+            Err(e) => eprintln!("iara: falha ao enviar as rotas: {e}"),
         }
     }
 
@@ -210,6 +259,7 @@ impl<B: Backend> Service<B> {
                 self.status.connected = true;
                 self.status.reconnect_attempts = 0;
                 self.apply_current(now);
+                self.sync_routes(true, now);
                 self.changed();
             }
             Err(e) => {
@@ -231,6 +281,8 @@ impl<B: Backend> Service<B> {
         self.backend = None; // o Engine remove os próprios objetos ao ser descartado
         self.status.connected = false;
         self.status.absent_devices.clear();
+        self.status.apps.clear();
+        self.last_routes = None;
         if self.retry.is_none() {
             self.retry = Some((now + BACKOFF[0], 0));
             self.status.reconnect_attempts = 1;
@@ -289,6 +341,7 @@ impl<B: Backend> Service<B> {
         let previous = std::mem::replace(&mut self.profile, next);
         self.changed();
         self.apply_current(now);
+        self.sync_routes(false, now);
         let actions = self.tracker.on_edit(&previous, kind, now);
         self.execute(actions);
     }
@@ -323,6 +376,35 @@ impl<B: Backend> Service<B> {
             Msg::Command(Command::GetState { reply }) => {
                 let _ = reply.send(self.snapshot());
             }
+            Msg::Command(Command::SessionChoice { key, choice, reply }) => {
+                let result = match choice {
+                    SessionChoice::Channel(id)
+                        if !self.profile.channels.iter().any(|c| c.id == id) =>
+                    {
+                        Err(format!("canal desconhecido: {id}"))
+                    }
+                    SessionChoice::Channel(id) => {
+                        self.overrides.insert(key, Some(id));
+                        Ok(())
+                    }
+                    SessionChoice::Unassigned => {
+                        self.overrides.insert(key, None);
+                        Ok(())
+                    }
+                    SessionChoice::Clear => {
+                        self.overrides.remove(&key);
+                        Ok(())
+                    }
+                };
+                let result = result.map(|()| {
+                    self.sync_routes(false, now);
+                    self.changed();
+                    self.serial
+                });
+                if let Some(r) = reply {
+                    let _ = r.send(result);
+                }
+            }
             Msg::Command(Command::Flush) => {
                 let actions = self.tracker.flush();
                 self.execute(actions);
@@ -338,6 +420,16 @@ impl<B: Backend> Service<B> {
             Msg::Engine(Event::DeviceAbsent(d)) => {
                 if !self.status.absent_devices.contains(&d) {
                     self.status.absent_devices.push(d);
+                    self.changed();
+                }
+            }
+            Msg::Engine(Event::Apps(reports)) => {
+                if self.status.apps != reports {
+                    self.status.apps = reports;
+                    if apps::prune_overrides(&mut self.overrides, &self.status.apps) {
+                        eprintln!("iara: escolha temporária encerrada (aplicativo parou de tocar)");
+                    }
+                    self.sync_routes(false, now);
                     self.changed();
                 }
             }
@@ -395,6 +487,7 @@ mod tests {
     #[derive(Default)]
     struct World {
         applied: RefCell<Vec<Plan>>,
+        routes: RefCell<Vec<HashMap<String, RouteTarget>>>,
         connects: Cell<u32>,
         fail_connects: Cell<u32>,
         fail_apply_disconnected: Cell<bool>,
@@ -413,6 +506,14 @@ mod tests {
                 missing: vec![],
                 absent_devices: vec![],
             })
+        }
+
+        fn set_routes(&mut self, routes: HashMap<String, RouteTarget>) -> Result<(), EngineError> {
+            if self.0.fail_apply_disconnected.get() {
+                return Err(EngineError::Disconnected);
+            }
+            self.0.routes.borrow_mut().push(routes);
+            Ok(())
         }
     }
 
@@ -750,5 +851,189 @@ mod tests {
             "versões estritamente crescentes: {seen:?}"
         );
         assert_eq!(*seen.last().unwrap(), svc.snapshot().serial);
+    }
+
+    fn zen_report(state: iara_audio::AppRouteState) -> AppReport {
+        use iara_core::apps::AppIdentity;
+        AppReport {
+            identity: AppIdentity {
+                binary: Some("zen".into()),
+                name: Some("Zen".into()),
+                ..Default::default()
+            },
+            state,
+            streams: vec![],
+        }
+    }
+
+    fn assign(binary: &str, channel: Option<&str>) -> EditCommand {
+        EditCommand::AssignApp {
+            matcher: iara_core::apps::AppMatcher {
+                binary: Some(binary.into()),
+                ..Default::default()
+            },
+            channel: channel.map(Into::into),
+        }
+    }
+
+    fn last_route(world: &World, key: &str) -> Option<RouteTarget> {
+        world
+            .routes
+            .borrow()
+            .last()
+            .and_then(|m| m.get(key).cloned())
+    }
+
+    #[test]
+    fn routes_follow_rules_and_sessions_and_are_only_resent_when_they_change() {
+        use iara_audio::AppRouteState;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        let sent = |w: &World| w.routes.borrow().len();
+        assert_eq!(sent(&world), 1, "ao conectar, o plano (vazio) é enviado");
+
+        // o motor reporta o Zen sem regra: vai para Não atribuídos (padrão do sistema)
+        svc.handle(
+            Msg::Engine(Event::Apps(vec![zen_report(AppRouteState::Unmanaged)])),
+            t0,
+        );
+        assert_eq!(last_route(&world, "bin:zen"), Some(RouteTarget::Default));
+        let n = sent(&world);
+        // o mesmo relatório de novo não reenvia
+        svc.handle(
+            Msg::Engine(Event::Apps(vec![zen_report(AppRouteState::Unmanaged)])),
+            t0,
+        );
+        assert_eq!(sent(&world), n);
+
+        // regra salva: o aplicativo passa ao canal
+        let (msg, rx) = edit(assign("zen", Some("media")));
+        svc.handle(msg, t0);
+        assert!(rx.try_recv().unwrap().is_ok());
+        assert_eq!(
+            last_route(&world, "bin:zen"),
+            Some(RouteTarget::Node("iara.ch.media".into()))
+        );
+        assert_eq!(svc.profile().rules.len(), 1);
+
+        // escolha só desta sessão vence a regra e NÃO altera o perfil
+        let (tx, rx) = mpsc::channel();
+        svc.handle(
+            Msg::Command(Command::SessionChoice {
+                key: "bin:zen".into(),
+                choice: SessionChoice::Channel("game".into()),
+                reply: Some(tx),
+            }),
+            t0,
+        );
+        assert!(rx.try_recv().unwrap().is_ok());
+        assert_eq!(
+            last_route(&world, "bin:zen"),
+            Some(RouteTarget::Node("iara.ch.game".into()))
+        );
+        assert_eq!(
+            svc.profile().rules[0].channel,
+            "media",
+            "a regra salva não mudou"
+        );
+        let snap = svc.snapshot();
+        assert_eq!(
+            (snap.apps[0].channel.as_deref(), snap.apps[0].source),
+            (Some("game"), iara_core::apps::Source::SessionOverride)
+        );
+
+        // "reaplicar a regra" apaga a escolha temporária
+        let (tx, _rx) = mpsc::channel();
+        svc.handle(
+            Msg::Command(Command::SessionChoice {
+                key: "bin:zen".into(),
+                choice: SessionChoice::Clear,
+                reply: Some(tx),
+            }),
+            t0,
+        );
+        assert_eq!(
+            last_route(&world, "bin:zen"),
+            Some(RouteTarget::Node("iara.ch.media".into()))
+        );
+    }
+
+    #[test]
+    fn a_session_choice_ends_when_the_app_stops_and_unknown_channels_are_refused() {
+        use iara_audio::AppRouteState;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        svc.handle(
+            Msg::Engine(Event::Apps(vec![zen_report(AppRouteState::Applied)])),
+            t0,
+        );
+        let (tx, rx) = mpsc::channel();
+        svc.handle(
+            Msg::Command(Command::SessionChoice {
+                key: "bin:zen".into(),
+                choice: SessionChoice::Channel("fantasma".into()),
+                reply: Some(tx),
+            }),
+            t0,
+        );
+        assert!(rx.try_recv().unwrap().unwrap_err().contains("fantasma"));
+        let (tx, _rx) = mpsc::channel();
+        svc.handle(
+            Msg::Command(Command::SessionChoice {
+                key: "bin:zen".into(),
+                choice: SessionChoice::Unassigned,
+                reply: Some(tx),
+            }),
+            t0,
+        );
+        assert_eq!(svc.snapshot().apps[0].channel, None);
+        // o aplicativo sai (some do relatório): a escolha termina
+        svc.handle(Msg::Engine(Event::Apps(vec![])), t0);
+        svc.handle(
+            Msg::Engine(Event::Apps(vec![zen_report(AppRouteState::Applied)])),
+            t0,
+        );
+        assert_eq!(last_route(&world, "bin:zen"), Some(RouteTarget::Default));
+        let snap = svc.snapshot();
+        assert_eq!(snap.apps[0].source, iara_core::apps::Source::Default);
+    }
+
+    #[test]
+    fn silent_rules_show_as_waiting_and_a_reconnect_resends_the_routes() {
+        use iara_audio::AppRouteState;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        let (msg, _rx) = edit(assign("discord", Some("chat")));
+        svc.handle(msg, t0);
+        let snap = svc.snapshot();
+        assert_eq!(snap.apps.len(), 1);
+        assert_eq!(
+            (snap.apps[0].state, snap.apps[0].channel.as_deref()),
+            (crate::apps::AppState::Waiting, Some("chat"))
+        );
+
+        svc.handle(
+            Msg::Engine(Event::Apps(vec![zen_report(AppRouteState::Applied)])),
+            t0,
+        );
+        assert_eq!(svc.status().apps.len(), 1);
+        let before = world.routes.borrow().len();
+        svc.handle(Msg::Engine(Event::Disconnected), t0 + s(1));
+        assert!(
+            svc.status().apps.is_empty(),
+            "inventário antigo some junto com a conexão"
+        );
+        svc.tick(t0 + s(2));
+        assert!(svc.status().connected);
+        assert!(
+            world.routes.borrow().len() > before,
+            "após reconectar, o plano é reenviado"
+        );
     }
 }
