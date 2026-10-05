@@ -1,6 +1,7 @@
 //! Modelo de apresentação: transforma o retrato do serviço no que a janela mostra e traduz gestos em valores de domínio.
 //! Sem GTK e sem D-Bus: tudo aqui é função pura sobre `iara_ipc::State`.
 
+use iara_core::edit::EditCommand;
 use iara_core::{chatmix, Gain, Profile, SendControl};
 use iara_ipc::State;
 
@@ -81,6 +82,16 @@ pub enum ColumnKind {
     Mic,
 }
 
+/// Controles extras do MIC, numa área expansível da própria coluna (spec 8.13): mute global sempre visível,
+/// ganho de entrada comum e o ramo "Microfone para aplicativos".
+#[derive(Debug, Clone, PartialEq)]
+pub struct MicExtras {
+    pub global_mute: bool,
+    pub input_position: f64,
+    pub input_label: String,
+    pub applications: SendView,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnView {
     pub kind: ColumnKind,
@@ -89,6 +100,7 @@ pub struct ColumnView {
     pub title: String,
     pub personal: SendView,
     pub transmission: SendView,
+    pub mic: Option<MicExtras>,
 }
 
 /// Ordem da spec 9: MASTER primeiro, canais na ordem do perfil, MIC por último.
@@ -116,6 +128,7 @@ pub fn columns(profile: &Profile) -> Vec<ColumnView> {
         title: "MASTER".into(),
         personal: send_view(&profile.master.personal, None),
         transmission: send_view(&profile.master.transmission, None),
+        mic: None,
     });
     for c in &profile.channels {
         out.push(ColumnView {
@@ -124,6 +137,7 @@ pub fn columns(profile: &Profile) -> Vec<ColumnView> {
             title: c.name.clone(),
             personal: send_view(&c.personal, factor_of(&c.id)),
             transmission: send_view(&c.transmission, None),
+            mic: None,
         });
     }
     let m = &profile.microphone;
@@ -133,8 +147,68 @@ pub fn columns(profile: &Profile) -> Vec<ColumnView> {
         title: "MIC".into(),
         personal: send_view(&m.personal, None),
         transmission: send_view(&m.transmission, None),
+        mic: Some(MicExtras {
+            global_mute: m.global_mute,
+            input_position: gain_to_position(m.input_gain),
+            input_label: format_db(m.input_gain),
+            applications: send_view(&m.applications, None),
+        }),
     });
     out
+}
+
+/// Barra do ChatMix: os dois canais do par (pelo nome atual) e a posição em [-1, 1]. `None` com o ChatMix desligado.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatMixView {
+    pub first: String,
+    pub second: String,
+    pub position: f64,
+}
+
+pub fn chatmix_view(profile: &Profile) -> Option<ChatMixView> {
+    let (a, b) = profile.chatmix.channels.as_ref()?;
+    let title = |id: &str| {
+        profile
+            .channels
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.name.clone())
+    };
+    Some(ChatMixView {
+        first: title(a)?,
+        second: title(b)?,
+        position: profile.chatmix.position,
+    })
+}
+
+/// Chave de coalescência: comandos de valor contínuo para o mesmo alvo (um gesto de slider gera dezenas) valem só pelo último.
+fn coalesce_key(cmd: &EditCommand) -> Option<String> {
+    use EditCommand as E;
+    Some(match cmd {
+        E::SetChannelGain { channel, send, .. } => format!("cg/{channel}/{send:?}"),
+        E::SetMasterGain { send, .. } => format!("mg/{send:?}"),
+        E::SetMicInputGain(_) => "mig".to_owned(),
+        E::SetMicSendGain { send, .. } => format!("msg/{send:?}"),
+        E::SetChatMixPosition(_) => "cmx".to_owned(),
+        _ => return None,
+    })
+}
+
+/// Reduz uma fila de comandos pendentes: dos ajustes de valor para o mesmo alvo fica só o último (na posição do último);
+/// o resto (mutes, habilitações, ações estruturais) segue intacto e em ordem.
+pub fn coalesce(commands: Vec<EditCommand>) -> Vec<EditCommand> {
+    let mut last: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, c) in commands.iter().enumerate() {
+        if let Some(k) = coalesce_key(c) {
+            last.insert(k, i);
+        }
+    }
+    commands
+        .into_iter()
+        .enumerate()
+        .filter(|(i, c)| coalesce_key(c).is_none_or(|k| last[&k] == *i))
+        .map(|(_, c)| c)
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,9 +256,60 @@ pub fn status_lines(state: &State) -> Vec<StatusLine> {
     lines
 }
 
+/// Id lógico a partir de um nome digitado: minúsculas ASCII, dígitos, `-` e `_`; único entre `existing`. `None` se o nome
+/// não tiver nenhum caractere aproveitável.
+pub fn slug(name: &str, existing: &[String]) -> Option<String> {
+    let mut base = String::new();
+    for ch in name.chars().flat_map(char::to_lowercase) {
+        let ch = match ch {
+            'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+            'é' | 'ê' | 'è' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            c => c,
+        };
+        if ch.is_ascii_alphanumeric() {
+            base.push(ch);
+        } else if matches!(ch, ' ' | '-' | '_') && !base.is_empty() && !base.ends_with('-') {
+            base.push('-');
+        }
+    }
+    let base = base
+        .trim_end_matches('-')
+        .chars()
+        .take(24)
+        .collect::<String>();
+    if base.is_empty() {
+        return None;
+    }
+    let mut id = base.clone();
+    let mut n = 1;
+    while existing.contains(&id) {
+        n += 1;
+        id = format!("{base}-{n}");
+    }
+    iara_core::is_valid_id(&id).then_some(id)
+}
+
+/// Texto para "não consegui falar com o serviço": o caso comum (serviço parado) em linguagem simples; o resto, com o detalhe.
+pub fn unavailable_text(detail: &str) -> String {
+    let lower = detail.to_lowercase();
+    if lower.contains("not activatable")
+        || lower.contains("namehasnoowner")
+        || lower.contains("procurando")
+    {
+        "O serviço do Iara não está em execução. Inicie o iara-service e esta janela se conecta sozinha.".to_owned()
+    } else {
+        format!("Sem conexão com o serviço do Iara: {detail}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iara_core::edit::SendKind;
     use iara_core::initial_profile;
 
     fn state(profile: Profile) -> State {
@@ -285,5 +410,112 @@ mod tests {
             (lines[2].kind, lines[2].text.as_str()),
             (StatusKind::Warning, "Dispositivo ausente: fone")
         );
+    }
+
+    #[test]
+    fn mic_column_carries_the_expandable_extras_and_other_columns_do_not() {
+        let mut p = initial_profile();
+        p.microphone.global_mute = true;
+        p.microphone.input_gain = Gain::from_db(-20.0).unwrap();
+        let cols = columns(&p);
+        let mic = cols.last().unwrap().mic.as_ref().unwrap();
+        assert!(mic.global_mute && mic.applications.enabled);
+        assert_eq!(mic.input_label, "−20,0 dB");
+        assert!((mic.input_position - 2.0 / 3.0).abs() < 1e-9);
+        assert!(cols[..cols.len() - 1].iter().all(|c| c.mic.is_none()));
+        // o MIC inicial: escuta desabilitada (monitoramento desligado), transmissão ligada
+        assert!(
+            !cols.last().unwrap().personal.enabled && cols.last().unwrap().transmission.enabled
+        );
+    }
+
+    #[test]
+    fn chatmix_bar_follows_the_pair_by_current_names_and_disappears_when_off() {
+        let mut p = initial_profile();
+        p.channels[0].name = "Jogos".into();
+        p.chatmix.position = -0.4;
+        assert_eq!(
+            chatmix_view(&p),
+            Some(ChatMixView {
+                first: "Jogos".into(),
+                second: "CHAT".into(),
+                position: -0.4
+            })
+        );
+        p.chatmix.channels = None;
+        assert_eq!(chatmix_view(&p), None);
+    }
+
+    #[test]
+    fn a_slider_burst_collapses_to_the_last_value_per_target_and_keeps_everything_else_in_order() {
+        let g = |db: f64| Gain::from_db(db).unwrap();
+        let gain = |ch: &str, db: f64| EditCommand::SetChannelGain {
+            channel: ch.into(),
+            send: SendKind::Personal,
+            gain: g(db),
+        };
+        let mute = EditCommand::SetMasterMute {
+            send: SendKind::Personal,
+            muted: true,
+        };
+        let queue = vec![
+            gain("game", -1.0),
+            gain("chat", -2.0),
+            gain("game", -3.0),
+            mute.clone(),
+            gain("game", -4.0),
+            EditCommand::SetChatMixPosition(0.1),
+            EditCommand::SetChatMixPosition(0.2),
+            EditCommand::RemoveChannel {
+                channel: "aux".into(),
+            },
+        ];
+        assert_eq!(
+            coalesce(queue),
+            vec![
+                gain("chat", -2.0),
+                mute,
+                gain("game", -4.0),
+                EditCommand::SetChatMixPosition(0.2),
+                EditCommand::RemoveChannel {
+                    channel: "aux".into()
+                },
+            ]
+        );
+        // alvos diferentes (envio de transmissão do mesmo canal) não se fundem
+        let tx = EditCommand::SetChannelGain {
+            channel: "game".into(),
+            send: SendKind::Transmission,
+            gain: g(-9.0),
+        };
+        assert_eq!(coalesce(vec![gain("game", -1.0), tx.clone()]).len(), 2);
+    }
+
+    #[test]
+    fn slugs_are_safe_unique_ids_from_names() {
+        let none: Vec<String> = vec![];
+        assert_eq!(slug("Música", &none).as_deref(), Some("musica"));
+        assert_eq!(
+            slug("  Vídeo  Chamada! ", &none).as_deref(),
+            Some("video-chamada")
+        );
+        assert_eq!(slug("a/b\\c", &none).as_deref(), Some("abc"));
+        assert_eq!(slug("!!!", &none), None);
+        assert_eq!(slug("", &none), None);
+        let taken = vec!["game".to_owned(), "game-2".to_owned()];
+        assert_eq!(slug("GAME", &taken).as_deref(), Some("game-3"));
+        assert!(iara_core::is_valid_id(
+            &slug(&"x".repeat(80), &none).unwrap()
+        ));
+    }
+
+    #[test]
+    fn a_stopped_service_gets_a_plain_message_and_other_failures_keep_their_detail() {
+        assert!(
+            unavailable_text("serviço indisponível: The name is not activatable")
+                .contains("não está em execução")
+        );
+        assert!(unavailable_text("procurando…").contains("não está em execução"));
+        assert!(unavailable_text("barramento sumiu").contains("barramento sumiu"));
     }
 }

@@ -11,7 +11,7 @@ O motor `iara-audio` cria nós virtuais `iara.*` no PipeWire da sessão enquanto
 - `iara-ipc`: contrato D-Bus (`dev.iara.Mixer1`), servidor e cliente tipado; sem dependência do serviço nem do PipeWire.
 - `iara-audio`: motor PipeWire; aplica um plano por diferença no próprio processo (nós, loopbacks, ganho/mute por Props). Precisa de libpipewire e clang.
 - `iara-service`: serviço de sessão: perfil ativo, supervisão e reconexão do motor, autosave e histórico. Expõe o contrato D-Bus.
-- `iara-ui`: ponto de entrada GTK4, habilitado por feature para separar dependências nativas.
+- `iara-ui`: janela GTK4 (feature `gtk-ui`) sobre um modelo de apresentação testável sem GTK; fala com o serviço só pelo cliente D-Bus.
 
 As provas da spec 6.3.2 estão em `docs/provas/registro.md` e `tools/provas/`; `tools/provas/07-motor-e2e.sh` exercita o motor real de ponta a ponta (cria nós temporários na sessão, mede e remove).
 
@@ -32,3 +32,16 @@ Ainda não há `Cargo.lock`: gere-o e versioná-lo após a primeira resolução 
 ## Próximo bloqueio técnico
 
 Execute as provas da seção 6.3 numa sessão Linux com PipeWire/WirePlumber. Meça os dois ramos capturados, não apenas sliders ou metadata. Só então escolha loopback, filter-chain ou processamento próprio e implemente o backend.
+
+## Janela
+
+![Mixer em modo de demonstração](docs/imagens/mixer-demo.png)
+
+```sh
+cargo run -p iara-service                                 # serviço (cria nós iara.* no PipeWire da sessão)
+cargo run -p iara-ui --features gtk-ui                    # janela, conecta ao serviço
+cargo run -p iara-ui --features gtk-ui -- --demo          # dados de exemplo, sem serviço
+cargo run -p iara-ui --features gtk-ui -- --demo --screenshot captura.png   # grava a janela em PNG e sai
+```
+
+`tools/provas/13-ui-ao-vivo.sh` abre a janela contra um serviço de teste, muda valores por fora (`busctl`) e captura o resultado.

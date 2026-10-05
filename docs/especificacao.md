@@ -351,6 +351,10 @@ Autosave agrupa gravações após 300 ms sem novo comando e faz flush ao conclui
 - Modo simplificado pode esconder transmissão, preservando configurações; sua semântica de desligamento precisa ser definida.
 - ChatMix proposto: equilíbrio de dois canais selecionáveis na escuta, inicialmente GAME/CHAT. Fórmula e interação com sliders ainda pendentes.
 
+### 9.1 Primeira versão da janela (implementada)
+
+Referência de layout (captura do Sonar fornecida pelo autor): coluna por canal com cabeçalho e engrenagem, dois sliders verticais (escuta e transmissão) com indicador de participação em cima e mute embaixo, MASTER com o grupo de aplicativos não atribuídos, ChatMix sob GAME/CHAT. A identidade visual é própria (paleta noturna azul-petróleo; aqua para a escuta e âmbar para a transmissão, sempre acompanhados de ícone e texto). Implementado: colunas MASTER, canais, MIC (mute global visível e área expansível “Microfone para aplicativos”), ChatMix com nota de atenuação adicional, criação/renomeação/remoção de canal (remoção em duas etapas), faixa de estados em texto (sem serviço, falha de gravação, dispositivo ausente, comando recusado). O valor mostrado é sempre em dB; o ícone de mute muda de estado; botões invisíveis reservam espaço para alinhar os sliders entre colunas. A janela só apresenta o retrato e envia comandos; arrastar um slider não é desfeito por ecos do serviço, e rajadas de comandos do mesmo alvo são reduzidas ao último valor. ID da aplicação GTK: `dev.iara.Panel` (distinto do nome do serviço no barramento, `dev.iara.Mixer`, para o GApplication não colidir com ele).
+
 ## 10. Requisitos de qualidade
 
 - Restaurar escolhas após reinício e mudanças de ordem de abertura dos aplicativos.
@@ -476,3 +480,4 @@ Consultadas em 05/10/2026. Fundamentam capacidades existentes; os comportamentos
 - **0.10.4 — 05/10/2026:** persistência implementada (`iara-store`): schema 1, gravação atômica com `.bak` válido, histórico FIFO de 50 revisões, importação sem sobrescrever; ids `[a-z0-9_-]` (1–32) e textos sem caracteres de controle validados no core e escapados nos argumentos do PipeWire (perfis importados são entrada não confiável).
 - **0.10.5 — 05/10/2026:** serviço implementado (`iara-service`): perfil ativo, supervisão do motor com reconexão, autosave 300 ms e agrupamento de histórico 2 s; reinício do PipeWire recuperado em ~1 s sem duplicar nós (prova 11).
 - **0.10.6 — 05/10/2026:** IPC D-Bus implementado e provado de fora com `busctl` (6.4.1): comandos granulares, retrato versionado, sinal `Changed`, instância única; novo canal nasce sem transmissão.
+- **0.10.7 — 05/10/2026:** primeira janela GTK4 sobre o IPC (9.1), com modelo de apresentação testado e verificação visual por captura gerada pela própria janela; ID de aplicação GTK definido.

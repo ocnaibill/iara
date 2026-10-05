@@ -1,22 +1,24 @@
 #[cfg(feature = "gtk-ui")]
-use gtk::prelude::*;
-
-#[cfg(feature = "gtk-ui")]
 fn main() -> gtk::glib::ExitCode {
-    let app = gtk::Application::builder()
-        .application_id("dev.iara.Mixer")
-        .build();
-    app.connect_activate(|app| {
-        let label = gtk::Label::new(Some(&format!(
-            "Iara — Mixer de áudio para Linux\nEspecificação {}\nServiço e áudio ainda não conectados.",
-            iara_core::SPEC_VERSION
-        )));
-        let window = gtk::ApplicationWindow::builder()
-            .application(app).title("Iara")
-            .default_width(960).default_height(640).child(&label).build();
-        window.present();
-    });
-    app.run()
+    use iara_ui::app::{run, Options};
+    let mut opts = Options {
+        demo: false,
+        screenshot: None,
+        bus_name: std::env::var("IARA_BUS_NAME").unwrap_or_else(|_| iara_ipc::BUS_NAME.to_owned()),
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--demo" => opts.demo = true,
+            "--screenshot" => opts.screenshot = args.next().map(Into::into),
+            "--help" | "-h" => {
+                eprintln!("uso: iara-ui [--demo] [--screenshot ARQUIVO.png]\n  --demo: mostra dados de exemplo, sem serviço\n  IARA_BUS_NAME: nome do serviço no D-Bus (testes)");
+                return gtk::glib::ExitCode::SUCCESS;
+            }
+            other => eprintln!("argumento ignorado: {other}"),
+        }
+    }
+    run(opts)
 }
 
 #[cfg(not(feature = "gtk-ui"))]
