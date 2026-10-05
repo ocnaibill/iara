@@ -264,6 +264,28 @@ ilegível, backoff da conexão, reaplicação do **perfil atual** após queda (p
 Limites: o reinício de PipeWire testado é o do systemd (rápido por ativação de socket); queda abrupta do daemon, reinícios repetidos e o reencaminhamento dos fluxos
 associados por regra (não há regras ainda) não foram exercitados. Sem IPC: o serviço ainda não aceita comandos de uma interface.
 
+## Prova 12 — IPC D-Bus de ponta a ponta, com cliente independente
+
+Script: `tools/provas/12-ipc-e2e.sh` (serviço real, PipeWire real, barramento de sessão real, diretórios XDG isolados, nome de teste via
+`IARA_BUS_NAME`; o cliente é o `busctl`, não o nosso código). Testes de integração do crate: `cargo test -p iara-ipc` (5, contra o barramento real;
+sem barramento eles se declaram ignorados).
+
+| Etapa | Resultado |
+| --- | --- |
+| Interface publicada | 18 métodos e 1 sinal (`busctl introspect`), assinatura de `GetState` = `tsbsasu` |
+| `SetChannelGain game personal -6` | resposta `t 4`; GAME → MASTER pessoal passou de −9,27 para **−15,27 dBFS** (−6,00 dB reais) |
+| mesmo comando com `-inf` | −∞ medido (silêncio exato) |
+| Argumentos inválidos | erros D-Bus com a razão: envio inválido, ChatMix fora da faixa, id `../x` |
+| `AddChannel musica` | 45 nós (42 + 1 sink + 2 streams do envio pessoal); transmissão do canal novo desligada |
+| Segunda instância, mesmo nome | recusada (código 1, "já existe uma instância do serviço rodando") |
+| `SetMicGlobalMute` e SIGTERM logo em seguida | saída 0; 0 nós; disco com mute global, canal novo e o silêncio do GAME; 4 revisões no histórico |
+
+Achados durante a implementação: (1) por padrão o `zbus` deixa uma segunda instância **assumir** o nome de outra — o servidor agora pede o nome sem
+`ReplaceExisting` e sem `AllowReplacement` e há teste para isso; (2) o `busctl` lê `-6` e `-inf` como opções (usar `--`); (3) erros do próprio
+barramento (`ServiceUnknown`, `NoReply`…) são classificados no cliente como "serviço indisponível", distintos de "comando recusado".
+
+Limites: medidores de nível não passam pelo IPC (spec 6.4); o serviço ainda não faz troca de perfil nem associação de aplicativos; a janela GTK ainda não usa o cliente.
+
 ### O que isto NÃO prova
 
 - Medições longas (horas), CPU com medidores de nível ativos e com efeitos; o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.

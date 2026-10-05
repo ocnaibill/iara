@@ -188,6 +188,16 @@ As entradas selecionáveis por outros aplicativos são “Iara — Microfone” 
 
 A prova fecha topologia, hospedagem, binding/versão e requisitos mínimos da distribuição. Até lá, o serviço contém backend explicitamente indisponível; o workspace compilar, isoladamente, não demonstra ganhos independentes nem recuperação de áudio.
 
+#### 6.4.1 Contrato de IPC (implementado)
+
+D-Bus de sessão: nome `dev.iara.Mixer` (instância única), objeto `/dev/iara/Mixer`, interface `dev.iara.Mixer1`. A interface gráfica (ou qualquer cliente) não é dona
+de estado: lê o retrato com `GetState` e muda coisas por comandos granulares (`SetChannelGain`, `SetChannelMute`, `SetChannelEnabled`, `SetMasterGain`, `SetMasterMute`,
+`SetMicGlobalMute`, `SetMicInputGain`, `SetMicSend{Gain,Mute,Enabled}`, `SetChatMixPosition`, `SetChatMixChannels`, `SetPreferredOutput`, `SetPreferredMicrophone`,
+`AddChannel`, `RenameChannel`, `RemoveChannel`). Cada comando é validado e aplicado de forma atômica pelo serviço e devolve a nova versão do estado; comando inválido volta como
+erro D-Bus com o motivo e não altera nada. O sinal `Changed(serial)` avisa que perfil ou status mudaram; o cliente relê o retrato (rajadas podem ser coalescidas). `GetState` devolve
+(versão, perfil em TOML no mesmo schema do disco, conectado ao áudio, erro de gravação, dispositivos ausentes, tentativas de reconexão). Ganho em dB; `-inf` é silêncio exato.
+Não há áudio no IPC. O crate `iara-ipc` contém contrato, servidor e cliente tipado e não depende do serviço nem do PipeWire (a janela depende só dele).
+
 ### 6.4 Comunicação e processamento
 
 Proposta inicial: D-Bus da sessão para comandos, retrato de estado e eventos. A frequência e o transporte dos medidores devem ser avaliados separadamente. A comunicação da interface não transporta os samples de áudio.
@@ -465,3 +475,4 @@ Consultadas em 05/10/2026. Fundamentam capacidades existentes; os comportamentos
 - **0.10.3 — 05/10/2026:** motor `iara-audio` validado ponta a ponta; fontes virtuais como `Audio/Source` (defeito do PipeWire 1.6.9 com `Audio/Source/Virtual`, 6.3.1.4).
 - **0.10.4 — 05/10/2026:** persistência implementada (`iara-store`): schema 1, gravação atômica com `.bak` válido, histórico FIFO de 50 revisões, importação sem sobrescrever; ids `[a-z0-9_-]` (1–32) e textos sem caracteres de controle validados no core e escapados nos argumentos do PipeWire (perfis importados são entrada não confiável).
 - **0.10.5 — 05/10/2026:** serviço implementado (`iara-service`): perfil ativo, supervisão do motor com reconexão, autosave 300 ms e agrupamento de histórico 2 s; reinício do PipeWire recuperado em ~1 s sem duplicar nós (prova 11).
+- **0.10.6 — 05/10/2026:** IPC D-Bus implementado e provado de fora com `busctl` (6.4.1): comandos granulares, retrato versionado, sinal `Changed`, instância única; novo canal nasce sem transmissão.

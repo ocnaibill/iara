@@ -1,4 +1,5 @@
 use iara_audio::{Engine, EventSink};
+use iara_service::ipc::ServiceController;
 use iara_service::service::{Command, Connector, Msg, Service};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::process::ExitCode;
@@ -23,6 +24,23 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("Iara: não foi possível carregar o perfil: {e}");
             return ExitCode::FAILURE;
+        }
+    };
+    // IPC: sem barramento de sessão o serviço segue headless; nome já ocupado = outra instância rodando.
+    // `IARA_BUS_NAME` existe para testes e desenvolvimento (outra instância sem colidir com a real).
+    let bus_name = std::env::var("IARA_BUS_NAME").unwrap_or_else(|_| iara_ipc::BUS_NAME.to_owned());
+    let _ipc = match iara_ipc::serve(&bus_name, Arc::new(ServiceController::new(tx.clone()))) {
+        Ok(server) => {
+            service.set_notifier(server.notifier());
+            Some(server)
+        }
+        Err(zbus::Error::NameTaken) => {
+            eprintln!("Iara: já existe uma instância do serviço rodando");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("Iara: sem IPC ({e}); o serviço segue sem interface");
+            None
         }
     };
     match signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) {

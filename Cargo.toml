@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/iara-core", "crates/iara-audio", "crates/iara-store", "crates/iara-service", "crates/iara-ui"]
-default-members = ["crates/iara-core", "crates/iara-store", "crates/iara-service"]
+members = ["crates/iara-core", "crates/iara-audio", "crates/iara-store", "crates/iara-ipc", "crates/iara-service", "crates/iara-ui"]
+default-members = ["crates/iara-core", "crates/iara-store", "crates/iara-ipc", "crates/iara-service"]
 resolver = "2"
 
 [workspace.package]

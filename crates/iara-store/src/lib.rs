@@ -153,6 +153,17 @@ fn parse_profile(text: &str) -> Result<Profile, StoreError> {
     profile_from_dto(dto).map_err(StoreError::Invalid)
 }
 
+/// Texto TOML do perfil (o mesmo schema do disco), para trocar o retrato de estado com outros processos.
+pub fn profile_to_toml(profile: &Profile) -> Result<String, StoreError> {
+    plan(profile).map_err(|e| StoreError::Invalid(format!("{e:?}")))?;
+    toml::to_string_pretty(&profile_to_dto(profile)).map_err(|e| StoreError::Invalid(e.to_string()))
+}
+
+/// Lê e valida um perfil em TOML (schema, faixas, ids, referências).
+pub fn profile_from_toml(text: &str) -> Result<Profile, StoreError> {
+    parse_profile(text)
+}
+
 fn parse_config(text: &str) -> Result<GlobalConfig, StoreError> {
     check_schema(text)?;
     let cfg: GlobalConfig = toml::from_str(text).map_err(|e| StoreError::Parse(e.to_string()))?;
@@ -629,6 +640,18 @@ mod tests {
             3,
             "importação inválida não cria nada"
         );
+    }
+
+    #[test]
+    fn toml_text_round_trips_and_rejects_hostile_input() {
+        let mut p = initial_profile();
+        p.channels[0].personal.gain = Gain::SILENCE;
+        assert_eq!(profile_from_toml(&profile_to_toml(&p).unwrap()).unwrap(), p);
+        assert!(profile_from_toml("schema_version = 99").is_err());
+        assert!(profile_from_toml("lixo [").is_err());
+        let mut bad = p.clone();
+        bad.chatmix.position = f64::NAN;
+        assert!(profile_to_toml(&bad).is_err());
     }
 
     #[test]
