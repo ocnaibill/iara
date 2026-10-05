@@ -2,7 +2,7 @@
 
 Concepção e especificação
 
-Versão: 0.9 · Data: 05/10/2026 · Autor da ideia: Bianco Oliveira
+Versão: 0.10 · Data: 05/10/2026 · Autor da ideia: Bianco Oliveira
 
 Nome do produto: **Iara** (confirmado). Documento evolutivo; ainda não é uma especificação de implementação fechada.
 
@@ -159,6 +159,10 @@ Proposta de hospedagem a testar primeiro: contexto PipeWire do serviço, que car
 
 Bindings Rust: avaliar candidatos pela API necessária (registry, metadata, links, params, streams e módulos), compatibilidade da biblioteca C, manutenção e licenças. Não fixar versão antes de compilar uma prova. O core não importa bindings nem IDs transitórios do PipeWire.
 
+#### 6.3.1.1 Estado do próprio Iara versus restauração do WirePlumber
+
+Medido (docs/provas/registro.md, prova 03): o WirePlumber 0.5.18 persiste volume e mute de sinks e streams e os restaura quando o nó reaparece, podendo contaminar a execução seguinte. Decisão: todo nó criado pelo Iara declara `state.restore-props=false` e `state.restore-target=false` (função única de montagem de propriedades, com teste que impede criar nó sem o opt-out) e o serviço aplica explicitamente ganho e mute do perfil quando o nó aparece no registro. Não se desliga a restauração globalmente nem se altera a configuração do WirePlumber do usuário. Pendente: confirmar se o WirePlumber ainda grava entradas para nós com opt-out.
+
 #### 6.3.2 Prova mínima e critérios de saída
 
 1. Numa sessão Linux real com PipeWire/WirePlumber, criar um canal e dois destinos capturáveis independentes. Gerar sinal conhecido e registrar rate/quantum/formato.
@@ -264,6 +268,8 @@ Confirmado: observar e mostrar alterações externas, respeitando-as temporariam
 Oferecer “reaplicar regra” e “salvar nova associação”. A substituição temporária vale para os fluxos reconhecidos da instância atual do aplicativo; um novo início independente segue as regras salvas, salvo decisão posterior sobre duração. Confirmado: a substituição termina ao encerrar a instância do aplicativo, trocar de perfil ou reaplicar a regra. Determinar o encerramento de aplicativos com múltiplos processos sem confundir pausa/ausência de fluxo com encerramento é uma lacuna técnica.
 
 Confirmado: opção por aplicativo “Sempre seguir o mixer”. Nesse modo, o serviço tenta restabelecer o destino do perfil após mudanças externas. Tentativas são limitadas; bloqueios ou alterações reiteradas geram diagnóstico, sem loop infinito de reconexão. Política proposta armazenada por aplicativo/regra no perfil ativo; escopo global permanece a definir. A matriz exata de quais parâmetros são incorporados ou apenas apresentados está pendente.
+
+**Restauração automática do WirePlumber.** Confirmado: quando o WirePlumber restaurar o destino ou os parâmetros de um fluxo (restauração de estado do gerenciador de sessão), isso não é tratado como ação do usuário. A restauração equivale a um aplicativo recém-aberto: o Iara aplica a regra do perfil uma vez; depois disso, mudanças externas voltam a ser respeitadas como substituição temporária (regras acima). Uma regra por aplicativo “Sempre seguir o mixer” continua com tentativas limitadas. Fluxos sem regra continuam no grupo Não atribuídos, ainda que o WirePlumber tente restaurá-los para outro destino. Distinguir restauração de ação externa do usuário depende de validação técnica (prova de metadata e política externa, 6.3.2 passo 7); enquanto isso não for demonstrável, a regra do perfil prevalece apenas no primeiro encaminhamento do fluxo.
 
 ### 8.10 Salvar e editar perfis
 
@@ -440,3 +446,5 @@ Consultadas em 05/10/2026. Fundamentam capacidades existentes; os comportamentos
 - **0.8 — 05/10/2026:** nome Iara confirmado pelo usuário. Sugestões de rótulos visíveis: “Iara — Saída principal”, “Iara — Microfone” e “Iara — Transmissão”; nomes técnicos internos ainda a definir.
 
 - **0.9 — 05/10/2026:** decisões documentais fechadas (ganho, ChatMix, histórico, TOML, MIT); protocolo verificável de provas técnicas; esqueleto Cargo separado do backend ainda não validado.
+
+- **0.10 — 05/10/2026:** provas 01–03 executadas e registradas; opt-out da restauração de estado do WirePlumber para nós do Iara; restauração do WirePlumber tratada como aplicativo novo (regra aplicada uma vez, depois respeita mudanças externas).

@@ -1,7 +1,7 @@
 //! Domínio compartilhado; sem dependência de GTK, PipeWire ou IPC.
 
 pub const HISTORY_LIMIT: usize = 50;
-pub const SPEC_VERSION: &str = "0.9";
+pub const SPEC_VERSION: &str = "0.10";
 
 /// Ganho digital de amplitude; None representa silêncio (-infinito dB).
 #[derive(Clone, Copy, Debug, PartialEq)]
