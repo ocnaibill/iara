@@ -2,6 +2,7 @@
 
 pub mod apps;
 pub mod edit;
+pub mod meter;
 pub mod topology;
 
 pub const HISTORY_LIMIT: usize = 50;
