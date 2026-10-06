@@ -236,6 +236,28 @@ impl Client {
         }
     }
 
+    /// Liga/desliga os medidores ao vivo para esta conexão. Ligue e desligue com o MESMO `Client` (o pedido é da conexão);
+    /// se o processo cair, o serviço solta o pedido sozinho.
+    pub fn set_meters(&self, enabled: bool) -> Result<(), ClientError> {
+        Ok(self.proxy.call("SetMeters", &(enabled,))?)
+    }
+
+    /// Assina o sinal `Levels` (pico linear por slider). Só chega algo depois de `set_meters(true)`.
+    pub fn subscribe_levels(&self) -> Result<LevelsSubscription, ClientError> {
+        let signals = self.proxy.receive_signal("Levels")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for msg in signals {
+                if let Ok(levels) = msg.body().deserialize::<Vec<(String, f64)>>() {
+                    if tx.send(levels).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(LevelsSubscription { rx })
+    }
+
     /// Assina o sinal `Changed`. Crie a assinatura ANTES de agir se não puder perder avisos; ela vive até o fim do processo
     /// (uma por aplicação basta: guarde-a e releia o estado a cada aviso).
     pub fn subscribe(&self) -> Result<Subscription, ClientError> {
@@ -267,6 +289,23 @@ impl Subscription {
 
     /// Descarta o acumulado e devolve a versão mais recente (coalescendo rajadas), se houver.
     pub fn latest(&self) -> Option<u64> {
+        self.rx.try_iter().last()
+    }
+}
+
+/// Níveis por slider recebidos do serviço.
+pub struct LevelsSubscription {
+    rx: std::sync::mpsc::Receiver<Vec<(String, f64)>>,
+}
+
+impl LevelsSubscription {
+    /// Próximo pacote de níveis, ou `None` se nada chegou no prazo.
+    pub fn wait(&self, timeout: Duration) -> Option<Vec<(String, f64)>> {
+        self.rx.recv_timeout(timeout).ok()
+    }
+
+    /// Descarta o acumulado e devolve só o pacote mais recente, se houver (a interface desenha o mais novo).
+    pub fn latest(&self) -> Option<Vec<(String, f64)>> {
         self.rx.try_iter().last()
     }
 }

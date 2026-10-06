@@ -14,6 +14,7 @@ struct Fake {
     notifier: Mutex<Option<iara_ipc::Notifier>>,
     sessions: Mutex<Vec<(String, SessionChoice)>>,
     profile_ops: Mutex<Vec<ProfileOp>>,
+    meter_calls: Mutex<Vec<bool>>,
 }
 
 impl Controller for Fake {
@@ -99,6 +100,11 @@ impl Controller for Fake {
         Ok(g.1)
     }
 
+    fn meters(&self, enabled: bool) -> Result<(), String> {
+        self.meter_calls.lock().unwrap().push(enabled);
+        Ok(())
+    }
+
     fn edit(&self, cmd: EditCommand) -> Result<u64, String> {
         let serial = {
             let mut g = self.inner.lock().unwrap();
@@ -135,6 +141,7 @@ fn start() -> Option<(String, Arc<Fake>, Server)> {
         notifier: Mutex::new(None),
         sessions: Mutex::new(Vec::new()),
         profile_ops: Mutex::new(Vec::new()),
+        meter_calls: Mutex::new(Vec::new()),
     });
     let server = serve(&name, fake.clone()).expect("serve");
     *fake.notifier.lock().unwrap() = Some(server.notifier());
@@ -453,4 +460,73 @@ fn physical_devices_travel_in_the_state() {
     assert_eq!(st.devices.len(), 2);
     assert!(st.devices[0].output && !st.devices[1].output);
     assert_eq!(st.devices[1].description, "Microfone USB");
+}
+
+fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..100 {
+        if cond() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("não aconteceu a tempo: {what}");
+}
+
+#[test]
+fn meter_requests_are_per_client_and_levels_reach_only_a_subscriber() {
+    let Some((name, fake, server)) = start() else {
+        return;
+    };
+    let a = Client::connect(name.clone()).unwrap();
+    let b = Client::connect(name.clone()).unwrap();
+    let levels = a.subscribe_levels().unwrap();
+    // nenhum pedido: nada acontece no serviço
+    assert!(fake.meter_calls.lock().unwrap().is_empty());
+    a.set_meters(true).unwrap();
+    b.set_meters(true).unwrap();
+    assert_eq!(
+        *fake.meter_calls.lock().unwrap(),
+        [true],
+        "só a transição vazio → não vazio chega ao serviço"
+    );
+    a.set_meters(false).unwrap();
+    assert_eq!(
+        *fake.meter_calls.lock().unwrap(),
+        [true],
+        "o outro cliente ainda quer"
+    );
+    // o serviço entrega os níveis pelo notificador do servidor
+    let notify = server.levels_notifier();
+    notify(vec![
+        ("ch:game:personal".into(), 0.5),
+        ("mic-apps".into(), 0.0),
+    ]);
+    let got = levels.wait(Duration::from_secs(3)).expect("sinal Levels");
+    assert_eq!(
+        got,
+        [
+            ("ch:game:personal".to_owned(), 0.5),
+            ("mic-apps".to_owned(), 0.0)
+        ]
+    );
+    b.set_meters(false).unwrap();
+    assert_eq!(*fake.meter_calls.lock().unwrap(), [true, false]);
+    // desligar de novo é inofensivo
+    b.set_meters(false).unwrap();
+    assert_eq!(fake.meter_calls.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn a_client_that_vanishes_loses_its_meter_request() {
+    let Some((name, fake, _server)) = start() else {
+        return;
+    };
+    {
+        let gone = Client::connect(name.clone()).unwrap();
+        gone.set_meters(true).unwrap();
+        assert_eq!(*fake.meter_calls.lock().unwrap(), [true]);
+    } // a conexão do cliente é fechada aqui, sem `set_meters(false)`
+    wait_until("o pedido do cliente que sumiu ser solto", || {
+        *fake.meter_calls.lock().unwrap() == [true, false]
+    });
 }

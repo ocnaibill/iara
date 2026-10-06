@@ -100,6 +100,7 @@ fn main() -> ExitCode {
     let _ipc = match iara_ipc::serve(&bus_name, Arc::new(ServiceController::new(tx.clone()))) {
         Ok(server) => {
             service.set_notifier(server.notifier());
+            service.set_levels_notifier(server.levels_notifier());
             Some(server)
         }
         Err(zbus::Error::NameTaken) => {

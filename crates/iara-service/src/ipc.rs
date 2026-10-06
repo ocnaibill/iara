@@ -119,6 +119,12 @@ impl Controller for ServiceController {
             .map_err(|_| "o serviço não respondeu a tempo".to_owned())?
     }
 
+    fn meters(&self, enabled: bool) -> Result<(), String> {
+        self.tx
+            .send(Msg::Command(Command::Meters(enabled)))
+            .map_err(|_| "serviço encerrando".to_owned())
+    }
+
     fn edit(&self, cmd: EditCommand) -> Result<u64, String> {
         let (reply, rx) = mpsc::channel();
         self.tx

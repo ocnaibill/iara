@@ -8,6 +8,7 @@
 mod defaults;
 pub mod devices;
 mod engine;
+mod meters;
 pub mod routing;
 
 pub use devices::DeviceInfo;

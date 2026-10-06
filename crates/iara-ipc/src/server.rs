@@ -1,13 +1,39 @@
 use crate::{Controller, State, INTERFACE, OBJECT_PATH};
 use iara_core::edit::{EditCommand, MicSend, SendKind};
 use iara_core::Gain;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use zbus::blocking::connection::Builder;
 use zbus::blocking::Connection;
 use zbus::fdo;
 
 struct Mixer {
     controller: Arc<dyn Controller>,
+    leases: Arc<MeterLeases>,
+}
+
+/// Pedidos de medidores, um por cliente do barramento (nome único da conexão). O controlador só é avisado quando o conjunto
+/// passa de vazio a não vazio e vice-versa; um cliente que some do barramento perde o pedido sozinho.
+struct MeterLeases {
+    holders: Mutex<HashSet<String>>,
+    controller: Arc<dyn Controller>,
+}
+
+impl MeterLeases {
+    fn set(&self, who: &str, on: bool) -> Result<(), String> {
+        let mut h = self.holders.lock().unwrap_or_else(|e| e.into_inner());
+        let before = !h.is_empty();
+        if on {
+            h.insert(who.to_owned());
+        } else {
+            h.remove(who);
+        }
+        let after = !h.is_empty();
+        if before != after {
+            self.controller.meters(after)?;
+        }
+        Ok(())
+    }
 }
 
 fn send(s: &str) -> fdo::Result<SendKind> {
@@ -272,11 +298,33 @@ impl Mixer {
         self.controller.deactivate().map_err(fdo::Error::Failed)
     }
 
+    /// Liga/desliga os medidores ao vivo para quem chama (um pedido por conexão; some se a conexão cair). Use a mesma
+    /// conexão para ligar e desligar.
+    fn set_meters(
+        &self,
+        enabled: bool,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<()> {
+        let who = header
+            .sender()
+            .map(|s| s.to_string())
+            .ok_or_else(|| fdo::Error::InvalidArgs("chamada sem remetente".into()))?;
+        self.leases.set(&who, enabled).map_err(fdo::Error::Failed)
+    }
+
     /// O retrato mudou (perfil ou status); releia com `GetState`.
     #[zbus(signal)]
     async fn changed(
         emitter: &zbus::object_server::SignalEmitter<'_>,
         serial: u64,
+    ) -> zbus::Result<()>;
+
+    /// Pico linear por slider (chave em texto, ver `iara_core::meter::MeterKey::encode`), cerca de 20 por segundo, só
+    /// enquanto algum cliente pediu medidores.
+    #[zbus(signal)]
+    async fn levels(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+        levels: Vec<(String, f64)>,
     ) -> zbus::Result<()>;
 }
 
@@ -298,6 +346,15 @@ impl Server {
         })
     }
 
+    /// Função para o serviço entregar os níveis por slider: emite `Levels`.
+    pub fn levels_notifier(&self) -> crate::LevelsNotifier {
+        let conn = self.connection.clone();
+        Box::new(move |levels| {
+            // Falha de envio (barramento caiu) é ignorada: os níveis são efêmeros e o próximo substitui este.
+            let _ = conn.emit_signal(None::<&str>, OBJECT_PATH, INTERFACE, "Levels", &(levels,));
+        })
+    }
+
     pub fn connection(&self) -> &Connection {
         &self.connection
     }
@@ -305,12 +362,41 @@ impl Server {
 
 /// Publica a interface no barramento de sessão sob `name`. Falha se o nome já tiver dono (instância única).
 pub fn serve(name: &str, controller: Arc<dyn Controller>) -> zbus::Result<Server> {
+    let leases = Arc::new(MeterLeases {
+        holders: Mutex::new(HashSet::new()),
+        controller: controller.clone(),
+    });
     // Instância única: não permite que outra tome o nome (allow_name_replacements) nem toma o de outra (replace_existing_names).
     let connection = Builder::session()?
         .allow_name_replacements(false)
         .replace_existing_names(false)
         .name(name.to_owned())?
-        .serve_at(OBJECT_PATH, Mixer { controller })?
+        .serve_at(
+            OBJECT_PATH,
+            Mixer {
+                controller,
+                leases: leases.clone(),
+            },
+        )?
         .build()?;
+    watch_clients(&connection, leases)?;
     Ok(Server { connection })
+}
+
+/// Solta o pedido de medidores de um cliente que saiu do barramento (processo encerrado sem desligar).
+fn watch_clients(connection: &Connection, leases: Arc<MeterLeases>) -> zbus::Result<()> {
+    let proxy = zbus::blocking::fdo::DBusProxy::new(connection)?;
+    let changes = proxy.receive_name_owner_changed()?;
+    std::thread::Builder::new()
+        .name("iara-ipc-clients".into())
+        .spawn(move || {
+            for change in changes {
+                let Ok(args) = change.args() else { continue };
+                if args.new_owner().is_none() {
+                    let _ = leases.set(args.name().as_str(), false);
+                }
+            }
+        })
+        .map_err(|e| zbus::Error::Failure(e.to_string()))?;
+    Ok(())
 }

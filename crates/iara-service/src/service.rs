@@ -30,6 +30,8 @@ pub trait Backend {
     fn set_routes(&mut self, routes: HashMap<String, RouteTarget>) -> Result<(), EngineError>;
     /// Define (ou apaga, com `None`) a saída padrão configurada do sistema.
     fn set_default_sink(&mut self, name: Option<String>) -> Result<(), EngineError>;
+    /// Liga os medidores nos barramentos dados (vazio desliga); os níveis voltam como `Event::Levels`.
+    fn set_meters(&mut self, buses: Vec<String>) -> Result<(), EngineError>;
 }
 
 impl Backend for Engine {
@@ -43,6 +45,10 @@ impl Backend for Engine {
 
     fn set_default_sink(&mut self, name: Option<String>) -> Result<(), EngineError> {
         Engine::set_default_sink(self, name)
+    }
+
+    fn set_meters(&mut self, buses: Vec<String>) -> Result<(), EngineError> {
+        Engine::set_meters(self, buses)
     }
 }
 
@@ -95,8 +101,13 @@ pub enum Command {
     Deactivate {
         reply: Option<Reply<Result<(), String>>>,
     },
+    /// Alguma interface quer (ou deixou de querer) medidores ao vivo. Sem pedido, nenhum tap existe no grafo.
+    Meters(bool),
     Shutdown,
 }
+
+/// Quem recebe os níveis por slider (chave em texto, pico linear), cerca de 20 vezes por segundo enquanto há pedido.
+pub type LevelsNotifier = Box<dyn Fn(Vec<(String, f64)>)>;
 
 pub enum Msg {
     Command(Command),
@@ -154,6 +165,9 @@ pub struct Service<B: Backend> {
     stopped: bool,
     serial: u64,
     notifier: Option<Box<dyn Fn(u64)>>,
+    levels_notifier: Option<LevelsNotifier>,
+    /// Alguma interface pediu medidores.
+    meters_wanted: bool,
     overrides: Overrides,
     last_routes: Option<HashMap<String, RouteTarget>>,
     policy: Policy,
@@ -222,6 +236,8 @@ impl<B: Backend> Service<B> {
             stopped: false,
             serial: 1,
             notifier: None,
+            levels_notifier: None,
+            meters_wanted: false,
             overrides: Overrides::new(),
             last_routes: None,
             policy: Policy::new(capture_default, stored_default),
@@ -234,6 +250,28 @@ impl<B: Backend> Service<B> {
     /// Registra quem é avisado a cada mudança de estado visível (perfil ou status), com a nova versão.
     pub fn set_notifier(&mut self, notifier: Box<dyn Fn(u64)>) {
         self.notifier = Some(notifier);
+    }
+
+    /// Registra quem recebe os níveis por slider (só chamado enquanto houver pedido de medidores).
+    pub fn set_levels_notifier(&mut self, notifier: LevelsNotifier) {
+        self.levels_notifier = Some(notifier);
+    }
+
+    /// Faz os taps do motor corresponderem ao pedido e ao perfil atual (canais criados/removidos mudam os barramentos).
+    fn sync_meters(&mut self, now: Instant) {
+        let buses = if self.meters_wanted {
+            iara_core::meter::tap_buses(&self.profile)
+        } else {
+            Vec::new()
+        };
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        match backend.set_meters(buses) {
+            Ok(()) => {}
+            Err(EngineError::Disconnected) => self.drop_backend(now),
+            Err(e) => eprintln!("iara: falha ao ajustar os medidores: {e}"),
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -578,6 +616,7 @@ impl<B: Backend> Service<B> {
             Err(EngineError::Disconnected) => self.drop_backend(now),
             Err(e) => eprintln!("iara: falha ao aplicar o perfil: {e}"),
         }
+        self.sync_meters(now);
         self.evaluate_default(now);
     }
 
@@ -703,6 +742,21 @@ impl<B: Backend> Service<B> {
                 self.status.connected = false;
                 self.stopped = true;
             }
+            Msg::Command(Command::Meters(on)) => {
+                if self.meters_wanted != on {
+                    self.meters_wanted = on;
+                    self.sync_meters(now);
+                }
+            }
+            Msg::Engine(Event::Levels(peaks)) => {
+                if let (true, Some(n)) = (self.meters_wanted, &self.levels_notifier) {
+                    let strips = iara_core::meter::strip_peaks(&self.profile, &peaks);
+                    n(strips
+                        .into_iter()
+                        .map(|(k, v)| (k.encode(), f64::from(v)))
+                        .collect());
+                }
+            }
             Msg::Engine(Event::Disconnected) => self.drop_backend(now),
             Msg::Engine(Event::DeviceAbsent(d)) => {
                 if !self.status.absent_devices.contains(&d) {
@@ -789,6 +843,7 @@ mod tests {
         applied: RefCell<Vec<Plan>>,
         routes: RefCell<Vec<HashMap<String, RouteTarget>>>,
         default_sets: RefCell<Vec<Option<String>>>,
+        meters: RefCell<Vec<Vec<String>>>,
         absent: RefCell<Vec<String>>,
         connects: Cell<u32>,
         fail_connects: Cell<u32>,
@@ -820,6 +875,11 @@ mod tests {
 
         fn set_default_sink(&mut self, name: Option<String>) -> Result<(), EngineError> {
             self.0.default_sets.borrow_mut().push(name);
+            Ok(())
+        }
+
+        fn set_meters(&mut self, buses: Vec<String>) -> Result<(), EngineError> {
+            self.0.meters.borrow_mut().push(buses);
             Ok(())
         }
     }
@@ -1834,5 +1894,89 @@ mod tests {
             .is_some());
         assert!(prof(&mut svc, ProfileOp::Delete("default".into()), t0).is_err());
         assert!(prof(&mut svc, ProfileOp::Delete("nao-existe".into()), t0).is_err());
+    }
+
+    type LevelsLog = Rc<RefCell<Vec<Vec<(String, f64)>>>>;
+
+    fn levels_log(svc: &mut Service<Fake>) -> LevelsLog {
+        let log = LevelsLog::default();
+        let l = log.clone();
+        svc.set_levels_notifier(Box::new(move |v| l.borrow_mut().push(v)));
+        log
+    }
+
+    fn game_bus(peak: f32) -> Msg {
+        Msg::Engine(Event::Levels(HashMap::from([(
+            "iara.ch.game".to_owned(),
+            peak,
+        )])))
+    }
+
+    #[test]
+    fn meters_are_only_requested_from_the_engine_while_an_interface_wants_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let log = levels_log(&mut svc);
+        let t0 = Instant::now();
+        svc.start(t0);
+        assert!(
+            world.meters.borrow().iter().all(Vec::is_empty),
+            "ninguém pediu: nenhum tap"
+        );
+        // níveis que chegarem sem pedido não saem do serviço
+        svc.handle(game_bus(0.5), t0);
+        assert!(log.borrow().is_empty());
+
+        svc.handle(Msg::Command(Command::Meters(true)), t0);
+        assert_eq!(
+            world.meters.borrow().last().unwrap().len(),
+            8,
+            "um tap por barramento"
+        );
+        svc.handle(game_bus(0.5), t0);
+        let out = log.borrow().last().cloned().unwrap();
+        let get = |k: &str| out.iter().find(|(n, _)| n == k).map(|(_, v)| *v);
+        assert!((get("ch:game:personal").unwrap() - 0.5).abs() < 1e-6);
+        assert!((get("ch:game:transmission").unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(get("ch:chat:personal"), Some(0.0));
+        assert!(get("master:personal").is_some() && get("mic-apps").is_some());
+
+        svc.handle(Msg::Command(Command::Meters(false)), t0);
+        assert!(world.meters.borrow().last().unwrap().is_empty());
+        let n = log.borrow().len();
+        svc.handle(game_bus(0.5), t0);
+        assert_eq!(log.borrow().len(), n, "depois de desligar nada mais sai");
+    }
+
+    #[test]
+    fn taps_follow_channel_changes_and_come_back_after_a_reconnection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        svc.handle(Msg::Command(Command::Meters(true)), t0);
+        let mut p = svc.profile().clone();
+        let (np, _) = iara_core::edit::apply(
+            &p,
+            &iara_core::edit::EditCommand::AddChannel {
+                id: "musica".into(),
+                name: "Música".into(),
+            },
+        )
+        .unwrap();
+        p = np;
+        svc.handle(
+            set(&p, EditKind::Structural(RevisionReason::Structural)),
+            t0,
+        );
+        let last = world.meters.borrow().last().cloned().unwrap();
+        assert_eq!(last.len(), 9);
+        assert!(last.iter().any(|b| b == "iara.ch.musica"));
+        // queda e reconexão: o novo motor recebe os taps de novo (o antigo se foi com a conexão)
+        svc.handle(Msg::Engine(Event::Disconnected), t0 + s(1));
+        let before = world.meters.borrow().len();
+        svc.tick(t0 + s(3));
+        assert!(world.meters.borrow().len() > before);
+        assert_eq!(world.meters.borrow().last().unwrap().len(), 9);
     }
 }

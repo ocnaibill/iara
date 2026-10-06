@@ -3,14 +3,15 @@
 //! - Nome `dev.iara.Mixer`, objeto `/dev/iara/Mixer`, interface `dev.iara.Mixer1`.
 //! - A interface nunca é dona do estado: lê um retrato (`GetState`) e muda coisas por comandos granulares; cada comando
 //!   devolve a nova versão. O sinal `Changed(serial)` avisa que o retrato mudou (perfil ou status); a interface relê.
-//! - Sem samples de áudio no IPC (spec 6.4); medidores ficam para um canal próprio.
+//! - Sem samples de áudio no IPC (spec 6.4). Medidores têm canal próprio: `SetMeters(bool)` é um pedido por cliente (some se o
+//!   cliente cair) e, enquanto houver algum, o sinal `Levels(a(sd))` traz o pico linear de cada slider (~20 por segundo).
 //! - Ganho em dB: `-inf` é o silêncio exato; fora disso vale a faixa −60..0.
 //! - Este crate não depende do serviço: o servidor fala com um `Controller` abstrato; o cliente só precisa de zbus.
 
 mod client;
 mod server;
 
-pub use client::{Client, ClientError, Subscription};
+pub use client::{Client, ClientError, LevelsSubscription, Subscription};
 pub use server::{serve, Server};
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,9 @@ use iara_core::Profile;
 pub const BUS_NAME: &str = "dev.iara.Mixer";
 pub const OBJECT_PATH: &str = "/dev/iara/Mixer";
 pub const INTERFACE: &str = "dev.iara.Mixer1";
+
+/// Quem recebe os níveis por slider: (chave em texto, pico linear).
+pub type LevelsNotifier = Box<dyn Fn(Vec<(String, f64)>) + Send + Sync>;
 
 /// Quem é avisado, com a nova versão, a cada mudança visível do estado.
 pub type Notifier = Box<dyn Fn(u64) + Send + Sync>;
@@ -232,4 +236,7 @@ pub trait Controller: Send + Sync + 'static {
     fn deactivate(&self) -> Result<(), String>;
     /// Operação sobre perfis; devolve o id novo (criar/duplicar) ou o do perfil ativo.
     fn profile_op(&self, op: ProfileOp) -> Result<String, String>;
+    /// Algum cliente quer (ou nenhum quer mais) medidores ao vivo. Chamado só quando o conjunto de pedidos muda de vazio
+    /// para não vazio e vice-versa.
+    fn meters(&self, enabled: bool) -> Result<(), String>;
 }

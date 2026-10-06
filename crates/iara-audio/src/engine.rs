@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(100);
+/// Intervalo de entrega dos níveis (cerca de 20 por segundo).
+const METER_TICK: Duration = Duration::from_millis(50);
 /// Espera mínima entre tentativas de religar um dispositivo (evita laço se o módulo se descarregar de novo).
 const DEVICE_RETRY: Duration = Duration::from_secs(2);
 /// Opt-out da restauração de volume/mute/destino do WirePlumber (prova 03) e marca de propriedade do Iara.
@@ -44,7 +46,7 @@ impl std::fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Event {
     Disconnected,
     /// O dispositivo físico preferido (chave persistente) não está no sistema; a ligação foi removida, sem fallback.
@@ -60,6 +62,8 @@ pub enum Event {
         configured: Option<String>,
         effective: Option<String>,
     },
+    /// Picos lineares (0..) por barramento desde o evento anterior; só enquanto os medidores estão ligados.
+    Levels(HashMap<String, f32>),
 }
 
 /// Resultado de uma aplicação. `missing` lista os nós esperados que não apareceram no registro dentro do prazo;
@@ -85,6 +89,8 @@ enum Command {
     /// Define (ou, com `None`, remove) a saída padrão configurada do sistema.
     SetDefaultSink(Option<String>),
     Apply(Box<Plan>, Reply),
+    /// Liga os medidores nos barramentos dados (substitui o conjunto anterior); lista vazia desliga.
+    SetMeters(Vec<String>),
     Shutdown,
 }
 
@@ -156,6 +162,13 @@ impl Engine {
     pub fn set_default_sink(&self, name: Option<String>) -> Result<(), EngineError> {
         self.tx
             .send(Command::SetDefaultSink(name))
+            .map_err(|_| EngineError::Disconnected)
+    }
+
+    /// Liga os taps de medição nos barramentos `buses` (por `node.name`); vazio desliga. Os níveis chegam em `Event::Levels`.
+    pub fn set_meters(&self, buses: Vec<String>) -> Result<(), EngineError> {
+        self.tx
+            .send(Command::SetMeters(buses))
             .map_err(|_| EngineError::Disconnected)
     }
 
@@ -282,6 +295,8 @@ struct State {
     /// Dispositivos físicos (saídas e entradas) por id do nó, e a última lista enviada.
     devices_seen: HashMap<u32, crate::DeviceInfo>,
     last_devices: Option<Vec<crate::DeviceInfo>>,
+    /// Taps de medição ativos (vazio quando nenhuma interface pede medidores).
+    taps: crate::meters::Taps,
 }
 
 fn props_pod(prop: u32, value: Value) -> Vec<u8> {
@@ -848,6 +863,24 @@ fn run(
             .register()
     };
 
+    // Entrega dos níveis: só roda enquanto há taps (armado e desarmado por `SetMeters`).
+    let meter_timer = {
+        let st = state.clone();
+        let ev = ev_tx.clone();
+        let t = mainloop.loop_().add_timer(move |_| {
+            let peaks = st.borrow().taps.take_peaks();
+            if !peaks.is_empty() {
+                ev(Event::Levels(peaks));
+            }
+        });
+        // SAFETY: o comando `SetMeters` roda num closure `'static` e precisa armar o timer, mas o timer empresta o laço.
+        // O laço (`mainloop`) vive até o fim desta função e todos os clones deste `Rc` moram em variáveis declaradas depois
+        // dele (`_rx`) ou são soltos antes dele (abaixo), então o empréstimo nunca é usado depois de o laço acabar.
+        Rc::new(unsafe {
+            std::mem::transmute::<pw::loop_::TimerSource<'_>, pw::loop_::TimerSource<'static>>(t)
+        })
+    };
+
     let timer = {
         let st = state.clone();
         let ctx = context.clone();
@@ -874,7 +907,14 @@ fn run(
         let core = core.clone();
         let ctx = context.clone();
         let ev = ev_tx.clone();
+        let mt = meter_timer.clone();
         rx.attach(mainloop.loop_(), move |cmd| match cmd {
+            Command::SetMeters(buses) => {
+                let mut s = st.borrow_mut();
+                s.taps.sync(&core, &buses);
+                let on = (!s.taps.is_empty()).then_some(METER_TICK);
+                let _ = mt.update_timer(on, on);
+            }
             Command::Shutdown => match core.sync(0) {
                 Ok(seq) => {
                     shutdown_seq.set(Some(seq));
@@ -912,12 +952,14 @@ fn run(
         if let Some(p) = st.pending.take() {
             let _ = p.reply.send(Err(EngineError::Disconnected));
         }
+        st.taps.clear();
         st.device_modules.clear();
         st.modules.clear();
         st.owned_nodes.clear();
         st.seen.clear();
     }
     drop(timer);
+    drop(meter_timer);
     let _ = disconnected;
 }
 

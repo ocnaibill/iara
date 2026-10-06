@@ -1,7 +1,7 @@
 //! Mixer mínimo por stdin para testar o motor de ponta a ponta (perfil → plano → PipeWire).
 //! Comandos: gain CANAL personal|transmission DB | mute CANAL personal|transmission true|false |
 //! enable CANAL personal|transmission true|false | mic-mute true|false | mic-gain DB | chatmix X |
-//! master-gain personal|transmission DB | output NÓ|none | mic-device NÓ|none | route CHAVE NÓ|default | remove CANAL | events | quit
+//! master-gain personal|transmission DB | meters on|off | levels | output NÓ|none | mic-device NÓ|none | route CHAVE NÓ|default | remove CANAL | events | quit
 use iara_audio::{Engine, Event, RouteTarget};
 use iara_core::topology::plan;
 use iara_core::{initial_profile, DevicePreference, Gain, Profile, SendControl};
@@ -101,6 +101,53 @@ fn main() {
                 }
                 continue;
             }
+            ["meters", state] => {
+                let buses = if *state == "on" {
+                    iara_core::meter::tap_buses(&profile)
+                } else {
+                    Vec::new()
+                };
+                match engine.set_meters(buses) {
+                    Ok(()) => println!("medidores {state}"),
+                    Err(e) => println!("erro: {e}"),
+                }
+                continue;
+            }
+            ["levels"] => {
+                // Máximo de cada barramento nos eventos acumulados (cada evento é o pico de ~50 ms) e quantos eventos vieram.
+                let mut max: std::collections::BTreeMap<String, f32> = Default::default();
+                let mut n = 0;
+                for e in engine.events() {
+                    if let Event::Levels(m) = e {
+                        n += 1;
+                        for (k, v) in m {
+                            let slot = max.entry(k).or_default();
+                            *slot = slot.max(v);
+                        }
+                    }
+                }
+                let strips =
+                    iara_core::meter::strip_peaks(&profile, &max.clone().into_iter().collect());
+                println!("eventos={n}");
+                for (k, v) in &max {
+                    println!(
+                        "barramento {k} {:.2} dBFS",
+                        iara_core::meter::peak_to_db(*v)
+                    );
+                }
+                let mut rows: Vec<String> = strips
+                    .iter()
+                    .map(|(k, v)| {
+                        format!("slider {k:?} {:.2} dBFS", iara_core::meter::peak_to_db(*v))
+                    })
+                    .collect();
+                rows.sort();
+                for r in rows {
+                    println!("{r}");
+                }
+                println!("fim-niveis");
+                continue;
+            }
             ["events", ..] => {
                 for e in engine.events() {
                     match e {
@@ -128,6 +175,7 @@ fn main() {
                             }
                             println!("--");
                         }
+                        Event::Levels(_) => {}
                         other => println!("evento {other:?}"),
                     }
                 }

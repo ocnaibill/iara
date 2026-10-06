@@ -33,6 +33,43 @@ pub enum MeterKey {
     MicApps,
 }
 
+impl MeterKey {
+    /// Forma de texto estável para o IPC: `ch:<id>:personal|transmission`, `master:personal|transmission`,
+    /// `mic:personal|transmission`, `mic-apps`. Os ids de canal não contêm `:`.
+    pub fn encode(&self) -> String {
+        let side = |tx: &bool| if *tx { "transmission" } else { "personal" };
+        match self {
+            Self::Channel { id, transmission } => format!("ch:{id}:{}", side(transmission)),
+            Self::Master { transmission } => format!("master:{}", side(transmission)),
+            Self::Mic { transmission } => format!("mic:{}", side(transmission)),
+            Self::MicApps => "mic-apps".to_owned(),
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let tx = |x: &str| match x {
+            "personal" => Some(false),
+            "transmission" => Some(true),
+            _ => None,
+        };
+        let mut it = s.split(':');
+        match (it.next()?, it.next(), it.next(), it.next()) {
+            ("ch", Some(id), Some(side), None) if crate::is_valid_id(id) => Some(Self::Channel {
+                id: id.to_owned(),
+                transmission: tx(side)?,
+            }),
+            ("master", Some(side), None, None) => Some(Self::Master {
+                transmission: tx(side)?,
+            }),
+            ("mic", Some(side), None, None) => Some(Self::Mic {
+                transmission: tx(side)?,
+            }),
+            ("mic-apps", None, None, None) => Some(Self::MicApps),
+            _ => None,
+        }
+    }
+}
+
 /// Nomes dos barramentos a medir para o perfil (um tap por nome).
 pub fn tap_buses(profile: &Profile) -> Vec<String> {
     let mut v: Vec<String> = profile
@@ -149,26 +186,16 @@ impl Meter {
         let fallen = (self.level_db - FALL_DB_PER_S * dt).max(FLOOR_DB);
         let new = peak.map_or(f32::NEG_INFINITY, peak_to_db).max(FLOOR_DB);
         self.level_db = new.max(fallen);
-        if self.level_db >= self.hold_db || self.hold_until.is_none_or(|t| now >= t) {
-            if self.level_db >= self.hold_db || self.hold_until.is_some() {
-                self.hold_db = self
-                    .level_db
-                    .max(if self.hold_until.is_some_and(|t| now < t) {
-                        self.hold_db
-                    } else {
-                        FLOOR_DB
-                    });
-            }
-            if new >= self.hold_db - f32::EPSILON || self.hold_until.is_none_or(|t| now >= t) {
-                self.hold_until = Some(now + PEAK_HOLD);
-            }
+        if self.level_db >= self.hold_db {
+            self.hold_db = self.level_db;
+            self.hold_until = (self.level_db > FLOOR_DB).then_some(now + PEAK_HOLD);
+        } else if self.hold_until.is_none_or(|t| now >= t) {
+            // passada a espera, o marcador acompanha a queda do nível
+            self.hold_db = self.level_db;
+            self.hold_until = None;
         }
         if peak.is_some_and(|p| peak_to_db(p) >= 0.0) {
             self.clip_until = Some(now + CLIP_HOLD);
-        }
-        if self.hold_until.is_some_and(|t| now >= t) && self.level_db < self.hold_db {
-            self.hold_db = self.level_db;
-            self.hold_until = None;
         }
     }
 
@@ -315,6 +342,51 @@ mod tests {
             strip_peaks(&mm, &bus)[&MeterKey::Mic { transmission: true }],
             0.0
         );
+    }
+
+    #[test]
+    fn keys_round_trip_through_their_wire_form_and_reject_garbage() {
+        let all = [
+            MeterKey::Channel {
+                id: "game".into(),
+                transmission: false,
+            },
+            MeterKey::Channel {
+                id: "my-ch_2".into(),
+                transmission: true,
+            },
+            MeterKey::Master {
+                transmission: false,
+            },
+            MeterKey::Master { transmission: true },
+            MeterKey::Mic {
+                transmission: false,
+            },
+            MeterKey::Mic { transmission: true },
+            MeterKey::MicApps,
+        ];
+        for k in all {
+            assert_eq!(
+                MeterKey::parse(&k.encode()).as_ref(),
+                Some(&k),
+                "{}",
+                k.encode()
+            );
+        }
+        for bad in [
+            "",
+            "ch",
+            "ch:game",
+            "ch:game:x",
+            "ch:Game:personal",
+            "ch:a:personal:extra",
+            "master",
+            "master:x",
+            "mic-apps:x",
+            "foo:personal",
+        ] {
+            assert_eq!(MeterKey::parse(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
