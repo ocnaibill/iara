@@ -267,6 +267,10 @@ struct State {
     /// Proxies dos fluxos de aplicativos, com o listener de `info`: as propriedades completas (ex.: `node.dont-move`)
     /// só chegam depois do anúncio no registro.
     stream_nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
+    /// Nós obsoletos (ex.: canal removido por troca de perfil) ainda vivos até os aplicativos saírem deles, e quando
+    /// começaram a esperar; e os ramos que os ligam (nome → (origem, destino)).
+    retiring_nodes: HashMap<String, Instant>,
+    retiring_branches: HashMap<String, (String, String)>,
     routes: HashMap<String, RouteTarget>,
     attempts: Attempts,
     last_report: Option<Vec<AppReport>>,
@@ -484,6 +488,54 @@ fn reconcile_routes(st: &mut State, ev: &EventSink) {
     if st.last_report.as_ref() != Some(&report) {
         st.last_report = Some(report.clone());
         ev(Event::Apps(report));
+    }
+}
+
+/// Destrói um nó obsoleto e os ramos que o ligam.
+fn destroy_retiring_node(st: &mut State, core: &pw::core::CoreRc, name: &str) {
+    let dead: Vec<String> = st
+        .retiring_branches
+        .iter()
+        .filter(|(_, (from, to))| from == name || to == name)
+        .map(|(b, _)| b.clone())
+        .collect();
+    for b in dead {
+        st.retiring_branches.remove(&b);
+        st.modules.remove(&b);
+        st.levels.remove(&out_name(&b));
+    }
+    st.retiring_nodes.remove(name);
+    if let Some(node) = st.owned_nodes.remove(name) {
+        let _ = core.destroy_object(node);
+    }
+}
+
+/// Remove os nós obsoletos cujos aplicativos já saíram (ou cujo prazo estourou).
+fn reap_retiring(st: &mut State, core: &pw::core::CoreRc) {
+    if st.retiring_nodes.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let due: Vec<String> = st
+        .retiring_nodes
+        .iter()
+        .filter(|(name, since)| {
+            let id = st
+                .nodes_present
+                .iter()
+                .find(|(_, n)| n == name)
+                .map(|(i, _)| *i);
+            let busy = id.is_some_and(|id| {
+                st.links
+                    .values()
+                    .any(|(out, inp)| *inp == id && st.streams.contains_key(out))
+            });
+            routing::reap_due(busy, now.duration_since(**since))
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in due {
+        destroy_retiring_node(st, core, &name);
     }
 }
 
@@ -746,7 +798,7 @@ fn run(
         let st = state.clone();
         let ctx = context.clone();
         let ev = ev_tx.clone();
-        let (ml_t, deadline) = (mainloop.clone(), shutdown_deadline.clone());
+        let (ml_t, deadline, core_t) = (mainloop.clone(), shutdown_deadline.clone(), core.clone());
         mainloop.loop_().add_timer(move |_| {
             // prazo-limite do encerramento (o daemon pode não responder)
             if deadline.get().is_some_and(|d| Instant::now() >= d) {
@@ -755,6 +807,7 @@ fn run(
             }
             reconcile_devices(&mut st.borrow_mut(), &ctx, &ev);
             reconcile_routes(&mut st.borrow_mut(), &ev);
+            reap_retiring(&mut st.borrow_mut(), &core_t);
             check_pending(&st, false);
         })
     };
@@ -835,10 +888,12 @@ fn apply(
     };
     let current = state.borrow().applied.clone().unwrap_or(empty);
     let d = diff(&current, &plan);
-    let (rm_branches, rm_nodes): (Vec<String>, Vec<String>) = (
-        d.remove_branches.iter().map(|b| b.name.clone()).collect(),
-        d.remove_nodes.iter().map(|n| n.name.clone()).collect(),
-    );
+    let rm_branches: Vec<(String, String, String)> = d
+        .remove_branches
+        .iter()
+        .map(|b| (b.name.clone(), b.from.clone(), b.to.clone()))
+        .collect();
+    let rm_nodes: Vec<String> = d.remove_nodes.iter().map(|n| n.name.clone()).collect();
     let add_nodes: Vec<NodeSpec> = d.add_nodes.iter().map(|n| (*n).clone()).collect();
     let add_branches: Vec<BranchSpec> = d.add_branches.iter().map(|b| (*b).clone()).collect();
     let retune: Vec<BranchSpec> = d.retune.iter().map(|b| (*b).clone()).collect();
@@ -846,17 +901,33 @@ fn apply(
     let add_sources: Vec<SourceSpec> = d.add_sources.iter().map(|x| (*x).clone()).collect();
 
     let mut st = state.borrow_mut();
-    // 1) remove ramos antes dos nós que eles ligam
-    for name in &rm_branches {
-        st.modules.remove(name); // Drop destrói o módulo
-        st.levels.remove(&out_name(name));
+    // 1) remove o que saiu do plano. Nós obsoletos e os ramos que os ligam ficam vivos até os aplicativos serem
+    //    redirecionados (spec 8.4): destruí-los já derrubaria os fluxos na saída física. O resto sai agora.
+    let now = Instant::now();
+    for (name, from, to) in &rm_branches {
+        if rm_nodes.contains(from) || rm_nodes.contains(to) {
+            st.retiring_branches
+                .insert(name.clone(), (from.clone(), to.clone()));
+        } else {
+            st.modules.remove(name); // Drop destrói o módulo
+            st.levels.remove(&out_name(name));
+        }
     }
     for name in &rm_sources {
         st.modules.remove(name);
     }
     for name in &rm_nodes {
-        if let Some(node) = st.owned_nodes.remove(name) {
-            let _ = core.destroy_object(node);
+        st.retiring_nodes.entry(name.clone()).or_insert(now);
+    }
+    // reaproveitar um nome que ainda está se aposentando: destrói o antigo antes de criar o novo (nunca dois com o mesmo nome)
+    for spec in &add_nodes {
+        if st.retiring_nodes.contains_key(&spec.name) {
+            destroy_retiring_node(&mut st, core, &spec.name);
+        }
+    }
+    for b in &add_branches {
+        if st.retiring_branches.remove(&b.name).is_some() {
+            st.modules.remove(&b.name);
         }
     }
     // 2) cria nós e ramos

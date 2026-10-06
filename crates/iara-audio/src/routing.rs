@@ -12,6 +12,15 @@ use iara_core::apps::AppIdentity;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+/// Prazo máximo que um objeto obsoleto (ex.: canal removido) continua vivo esperando os aplicativos saírem dele.
+pub const RETIRE_MAX: Duration = Duration::from_secs(5);
+
+/// Um objeto obsoleto pode ser destruído quando nenhum aplicativo está mais ligado a ele, ou quando o prazo estourou
+/// (a spec 8.4 manda remover os obsoletos só depois de redirecionar os fluxos, sem abrir caminho transitório).
+pub fn reap_due(busy: bool, age: Duration) -> bool {
+    !busy || age >= RETIRE_MAX
+}
+
 /// Tempo para o link aparecer depois de pedir a mudança; passado isso sem efeito, o fluxo conta como não aplicado.
 pub const APPLY_GRACE: Duration = Duration::from_secs(3);
 
@@ -453,6 +462,23 @@ mod tests {
             )[0]
             .state,
             AppRouteState::Applied
+        );
+    }
+
+    #[test]
+    fn an_obsolete_object_waits_for_its_streams_but_never_longer_than_the_limit() {
+        assert!(
+            reap_due(false, Duration::ZERO),
+            "ninguém ligado: pode sair já"
+        );
+        assert!(
+            !reap_due(true, Duration::from_secs(1)),
+            "ainda há fluxo ligado: espera"
+        );
+        assert!(!reap_due(true, RETIRE_MAX - Duration::from_millis(1)));
+        assert!(
+            reap_due(true, RETIRE_MAX),
+            "prazo estourado: sai mesmo assim"
         );
     }
 }

@@ -1,7 +1,7 @@
 //! Mixer mínimo por stdin para testar o motor de ponta a ponta (perfil → plano → PipeWire).
 //! Comandos: gain CANAL personal|transmission DB | mute CANAL personal|transmission true|false |
 //! enable CANAL personal|transmission true|false | mic-mute true|false | mic-gain DB | chatmix X |
-//! master-gain personal|transmission DB | output NÓ|none | mic-device NÓ|none | route CHAVE NÓ|default | events | quit
+//! master-gain personal|transmission DB | output NÓ|none | mic-device NÓ|none | route CHAVE NÓ|default | remove CANAL | events | quit
 use iara_audio::{Engine, Event, RouteTarget};
 use iara_core::topology::plan;
 use iara_core::{initial_profile, DevicePreference, Gain, Profile, SendControl};
@@ -79,6 +79,12 @@ fn main() {
             ["mic-device", node] => {
                 profile.preferred_microphone = pref(node);
                 true
+            }
+            ["remove", ch] => {
+                let before = profile.channels.len();
+                profile.channels.retain(|c| c.id != *ch);
+                profile.chatmix.channels = None;
+                before != profile.channels.len()
             }
             ["route", key, node] => {
                 routes.insert(
