@@ -99,8 +99,8 @@ impl Client {
             reconnect_attempts,
             apps,
             default_output,
-        ): (u64, String, bool, String, Vec<String>, u32, String, String) =
-            self.proxy.call("GetState", &())?;
+            profiles,
+        ): crate::StateWire = self.proxy.call("GetState", &())?;
         let apps = crate::apps_from_toml(&apps).map_err(ClientError::Rejected)?;
         let profile = iara_store::profile_from_toml(&toml)
             .map_err(|e| ClientError::Rejected(e.to_string()))?;
@@ -113,6 +113,10 @@ impl Client {
             reconnect_attempts,
             apps,
             default_output: crate::DefaultOutput::parse(&default_output).unwrap_or_default(),
+            profiles: profiles
+                .into_iter()
+                .map(|(id, name, readable)| crate::ProfileEntry { id, name, readable })
+                .collect(),
         })
     }
 
@@ -195,6 +199,19 @@ impl Client {
             crate::SessionChoice::Channel(id) => p.call("SetAppSession", &(key, id.as_str()))?,
             crate::SessionChoice::Unassigned => p.call("SetAppSession", &(key, ""))?,
             crate::SessionChoice::Clear => p.call("ClearAppSession", &(key,))?,
+        })
+    }
+
+    /// Operação sobre perfis; devolve o id novo (criar/duplicar) ou o do perfil ativo.
+    pub fn profile_op(&self, op: &crate::ProfileOp) -> Result<String, ClientError> {
+        use crate::ProfileOp as P;
+        let p = &self.proxy;
+        Ok(match op {
+            P::Switch(id) => p.call("SwitchProfile", &(id,))?,
+            P::Create(name) => p.call("CreateProfile", &(name,))?,
+            P::Duplicate { id, name } => p.call("DuplicateProfile", &(id, name))?,
+            P::Rename { id, name } => p.call("RenameProfile", &(id, name))?,
+            P::Delete(id) => p.call("DeleteProfile", &(id,))?,
         })
     }
 

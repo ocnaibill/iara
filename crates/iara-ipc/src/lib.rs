@@ -150,6 +150,49 @@ pub enum SessionChoice {
     Clear,
 }
 
+/// O retrato como trafega no D-Bus (assinatura `tsbsasussa(ssb)`): versão, perfil em TOML, conectado, erro de gravação,
+/// dispositivos ausentes, tentativas de reconexão, aplicativos em TOML, saída padrão e perfis (id, nome, legível).
+pub(crate) type StateWire = (
+    u64,
+    String,
+    bool,
+    String,
+    Vec<String>,
+    u32,
+    String,
+    String,
+    Vec<(String, String, bool)>,
+);
+
+/// Perfil na lista do retrato.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileEntry {
+    pub id: String,
+    pub name: String,
+    /// `false` se o arquivo do perfil não pôde ser lido (aparece para o usuário poder tratá-lo).
+    pub readable: bool,
+}
+
+/// Operações sobre perfis (spec 8.4, 8.10). `Create`/`Duplicate` devolvem o id novo; as demais, o id do perfil ativo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileOp {
+    /// Troca o perfil ativo (salva o atual, valida o destino, prepara o novo e só então remove o obsoleto).
+    Switch(String),
+    /// Perfil novo com os canais iniciais; herda os dispositivos do ativo. Não troca para ele.
+    Create(String),
+    /// Cópia independente de um perfil.
+    Duplicate {
+        id: String,
+        name: String,
+    },
+    Rename {
+        id: String,
+        name: String,
+    },
+    /// Vai para a lixeira (recuperável); o perfil ativo e o último perfil não podem ser excluídos.
+    Delete(String),
+}
+
 /// Retrato do estado, como a interface o vê.
 #[derive(Debug, Clone, PartialEq)]
 pub struct State {
@@ -161,6 +204,7 @@ pub struct State {
     pub reconnect_attempts: u32,
     pub apps: Vec<AppEntry>,
     pub default_output: DefaultOutput,
+    pub profiles: Vec<ProfileEntry>,
 }
 
 /// Quem atende o IPC: o serviço. Chamado de threads do D-Bus; deve responder com prazo.
@@ -172,4 +216,6 @@ pub trait Controller: Send + Sync + 'static {
     fn session_choice(&self, key: String, choice: SessionChoice) -> Result<u64, String>;
     /// “Desligar mixer / voltar ao áudio normal”: restaura a saída padrão anterior (se ainda for a do Iara) e encerra o serviço.
     fn deactivate(&self) -> Result<(), String>;
+    /// Operação sobre perfis; devolve o id novo (criar/duplicar) ou o do perfil ativo.
+    fn profile_op(&self, op: ProfileOp) -> Result<String, String>;
 }

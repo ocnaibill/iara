@@ -3,14 +3,15 @@
 
 use crate::backend::{Backend, OnUpdate, Update};
 use crate::model::{
-    chatmix_view, chips_by_column, columns, move_app, position_to_gain, reapply_rule, slug,
-    status_lines, AppChip, ColumnKind, ColumnView, SendView, StatusKind, UiCommand,
+    active_profile_label, chatmix_view, chips_by_column, columns, move_app, position_to_gain,
+    profile_rows, reapply_rule, slug, status_lines, AppChip, ColumnKind, ColumnView, SendView,
+    StatusKind, UiCommand,
 };
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 use iara_core::edit::{EditCommand, MicSend, SendKind};
 use iara_core::Gain;
-use iara_ipc::{AppEntry, AppSource, AppState, DefaultOutput, State};
+use iara_ipc::{AppEntry, AppSource, AppState, DefaultOutput, ProfileOp, State};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -23,7 +24,7 @@ const APP_ID: &str = "dev.iara.Panel";
 const CSS: &str = "
 window.iara { background: #0e1b22; color: #d8e6ea; }
 .iara headerbar { background: #0b151b; color: #d8e6ea; box-shadow: none; border-bottom: 1px solid #1c2f38; }
-.iara .profile { color: #7e98a1; }
+.iara menubutton.profile-button > button { background: transparent; border: none; color: #d8e6ea; font-weight: 600; }
 .iara .column { background: #14262e; border-radius: 10px; padding: 10px 8px 12px 8px; }
 .iara .column.master { background: #17303a; }
 .iara .col-title { font-weight: 800; letter-spacing: 1px; font-size: 13px; }
@@ -712,7 +713,13 @@ struct ChatMixBar {
 struct Ui {
     window: gtk::ApplicationWindow,
     banner: gtk::Box,
-    profile: gtk::Label,
+    profile: gtk::MenuButton,
+    /// Lista de perfis dentro do menu do cabeçalho, refeita só quando muda.
+    profile_list: gtk::Box,
+    profile_sig: RefCell<String>,
+    /// Id do perfil ativo (para "duplicar/renomear o ativo").
+    active_profile: Rc<RefCell<String>>,
+    emit_ui: EmitUi,
     row: gtk::Box,
     add_button: gtk::MenuButton,
     chatmix: ChatMixBar,
@@ -761,6 +768,49 @@ impl Ui {
         self.banner.set_visible(!lines.is_empty());
     }
 
+    /// Refaz as linhas do menu de perfis só quando a lista (ou o ativo) mudou.
+    fn refresh_profile_menu(&self, state: &State) {
+        let rows = profile_rows(state);
+        let sig = format!("{rows:?}");
+        if *self.profile_sig.borrow() == sig {
+            return;
+        }
+        *self.profile_sig.borrow_mut() = sig;
+        while let Some(c) = self.profile_list.first_child() {
+            self.profile_list.remove(&c);
+        }
+        for r in rows {
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            let pick = gtk::Button::with_label(&r.label);
+            pick.add_css_class("flat-btn");
+            pick.set_hexpand(true);
+            pick.set_sensitive(r.can_switch);
+            {
+                let (e, id) = (self.emit_ui.clone(), r.id.clone());
+                pick.connect_clicked(move |_| e(UiCommand::Profile(ProfileOp::Switch(id.clone()))));
+            }
+            line.append(&pick);
+            let trash = gtk::Button::from_icon_name("user-trash-symbolic");
+            trash.add_css_class("flat-btn");
+            trash.set_sensitive(r.can_delete);
+            trash.set_tooltip_text(Some("Excluir (vai para a lixeira, recuperável)"));
+            trash.update_property(&[gtk::accessible::Property::Label("Excluir perfil")]);
+            {
+                // exclusão em duas etapas: o primeiro clique pede confirmação
+                let (e, id) = (self.emit_ui.clone(), r.id.clone());
+                trash.connect_clicked(move |b| {
+                    if b.label().as_deref() == Some("Excluir?") {
+                        e(UiCommand::Profile(ProfileOp::Delete(id.clone())));
+                    } else {
+                        b.set_label("Excluir?");
+                    }
+                });
+            }
+            line.append(&trash);
+            self.profile_list.append(&line);
+        }
+    }
+
     /// Refaz as etiquetas só das colunas cuja lista mudou (reconstruir com um menu aberto o fecharia).
     fn refresh_chips(&self, state: &State) {
         let by = chips_by_column(state);
@@ -803,7 +853,9 @@ impl Ui {
             .iter()
             .map(|c| c.id.clone())
             .collect();
-        self.profile.set_text(&format!("— {}", state.profile.name));
+        self.profile.set_label(&active_profile_label(state));
+        *self.active_profile.borrow_mut() = state.profile.id.clone();
+        self.refresh_profile_menu(state);
         *self.ctx.apps.borrow_mut() = state.apps.clone();
         *self.ctx.channels.borrow_mut() = state
             .profile
@@ -930,6 +982,23 @@ pub fn demo_state() -> State {
         absent_devices: vec!["alsa_output.usb-fone-exemplo".into()],
         reconnect_attempts: 0,
         default_output: DefaultOutput::Active,
+        profiles: vec![
+            iara_ipc::ProfileEntry {
+                id: "default".into(),
+                name: "Padrão".into(),
+                readable: true,
+            },
+            iara_ipc::ProfileEntry {
+                id: "streaming".into(),
+                name: "Streaming".into(),
+                readable: true,
+            },
+            iara_ipc::ProfileEntry {
+                id: "jogos".into(),
+                name: "Só jogos".into(),
+                readable: true,
+            },
+        ],
         apps: vec![
             app(
                 "Zen",
@@ -1049,7 +1118,69 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
     let header = gtk::HeaderBar::new();
     let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     title.append(&label("Iara", "col-title"));
-    let profile = label("", "profile");
+    let profile_pop = gtk::Popover::new();
+    let profile_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    for set in [
+        gtk::Widget::set_margin_top,
+        gtk::Widget::set_margin_bottom,
+        gtk::Widget::set_margin_start,
+        gtk::Widget::set_margin_end,
+    ] {
+        set(profile_box.upcast_ref(), 10);
+    }
+    let profile_list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    profile_box.append(&label("PERFIS", "strip-caption"));
+    profile_box.append(&profile_list);
+    profile_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let profile_name = gtk::Entry::builder()
+        .placeholder_text("Nome do perfil")
+        .max_length(64)
+        .build();
+    profile_name.update_property(&[gtk::accessible::Property::Label(
+        "Nome do perfil para criar, duplicar ou renomear",
+    )]);
+    let (btn_new, btn_dup, btn_ren) = (
+        gtk::Button::with_label("Novo perfil"),
+        gtk::Button::with_label("Duplicar o ativo"),
+        gtk::Button::with_label("Renomear o ativo"),
+    );
+    profile_box.append(&profile_name);
+    for b in [&btn_new, &btn_dup, &btn_ren] {
+        b.add_css_class("flat-btn");
+        profile_box.append(b);
+    }
+    profile_pop.set_child(Some(&profile_box));
+    let active_profile: Rc<RefCell<String>> = Rc::default();
+    for (btn, kind) in [(&btn_new, 0), (&btn_dup, 1), (&btn_ren, 2)] {
+        let (e, entry, pop, active) = (
+            ctx.emit.clone(),
+            profile_name.clone(),
+            profile_pop.clone(),
+            active_profile.clone(),
+        );
+        btn.connect_clicked(move |_| {
+            let name = entry.text().trim().to_owned();
+            if name.is_empty() {
+                return;
+            }
+            let id = active.borrow().clone();
+            e(UiCommand::Profile(match kind {
+                0 => ProfileOp::Create(name),
+                1 => ProfileOp::Duplicate { id, name },
+                _ => ProfileOp::Rename { id, name },
+            }));
+            entry.set_text("");
+            pop.popdown();
+        });
+    }
+    let profile = gtk::MenuButton::builder()
+        .label("Perfil ▾")
+        .popover(&profile_pop)
+        .tooltip_text("Trocar, criar, duplicar ou renomear perfis")
+        .always_show_arrow(false)
+        .build();
+    profile.add_css_class("profile-button");
+    profile.update_property(&[gtk::accessible::Property::Label("Menu de perfis")]);
     title.append(&profile);
     header.set_title_widget(Some(&title));
     // arrastar ou mover um aplicativo salva uma regra; com este interruptor vale só nesta sessão (spec 8.1)
@@ -1207,6 +1338,10 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
         window: window.clone(),
         banner,
         profile,
+        profile_list,
+        profile_sig: RefCell::new(String::new()),
+        active_profile,
+        emit_ui: ctx.emit.clone(),
         row,
         add_button,
         chatmix: ChatMixBar {

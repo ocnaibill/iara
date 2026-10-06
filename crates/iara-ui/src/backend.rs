@@ -95,6 +95,7 @@ fn commands(name: &str, rx: mpsc::Receiver<UiCommand>, on_update: &OnUpdate) {
                 UiCommand::Edit(e) => c.edit(e),
                 UiCommand::Session { key, choice } => c.session_choice(key, choice),
                 UiCommand::Deactivate => c.deactivate().map(|()| 0),
+                UiCommand::Profile(op) => c.profile_op(op).map(|_| 0),
             };
             match result {
                 Ok(_) => {}

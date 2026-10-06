@@ -9,8 +9,8 @@ use iara_audio::{AppReport, ApplyReport, Engine, EngineError, Event, EventSink, 
 use iara_core::edit::{self, EditClass, EditCommand};
 use iara_core::topology::{plan, Plan};
 use iara_core::{initial_profile, Profile};
-use iara_ipc::DefaultOutput;
-use iara_store::{GlobalConfig, RevisionReason, Store, StoreError};
+use iara_ipc::{DefaultOutput, ProfileOp};
+use iara_store::{GlobalConfig, ProfileInfo, RevisionReason, Store, StoreError};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -57,6 +57,8 @@ pub struct Snapshot {
     pub status: Status,
     /// Aplicativos para a interface: tocando agora (com estado real) e com regra salva mas em silêncio.
     pub apps: Vec<AppView>,
+    /// Perfis existentes (o ativo é `profile.id`).
+    pub profiles: Vec<ProfileInfo>,
 }
 
 pub use iara_ipc::SessionChoice;
@@ -70,6 +72,11 @@ pub enum Command {
     /// Retrato atual do estado.
     GetState {
         reply: Reply<Snapshot>,
+    },
+    /// Operação sobre perfis (trocar, criar, duplicar, renomear, excluir). Responde com o id novo ou o do perfil ativo.
+    Profile {
+        op: ProfileOp,
+        reply: Option<Reply<Result<String, String>>>,
     },
     /// Escolha temporária de canal para um aplicativo (chave de identidade), sem alterar o perfil.
     SessionChoice {
@@ -152,6 +159,7 @@ pub struct Service<B: Backend> {
     observed_default: Option<String>,
     /// Já recebi a observação desta conexão? Sem ela, não se decide nada sobre a saída padrão.
     default_seen: bool,
+    profiles: Vec<ProfileInfo>,
 }
 
 /// Perfil ativo da configuração; sem nenhum, usa o primeiro existente ou cria o padrão. Nunca sobrescreve um perfil
@@ -217,6 +225,7 @@ impl<B: Backend> Service<B> {
             policy: Policy::new(capture_default, stored_default),
             observed_default: None,
             default_seen: false,
+            profiles: Vec::new(),
         })
     }
 
@@ -227,6 +236,7 @@ impl<B: Backend> Service<B> {
 
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
+            profiles: self.profiles.clone(),
             serial: self.serial,
             profile: self.profile.clone(),
             status: self.status.clone(),
@@ -236,6 +246,148 @@ impl<B: Backend> Service<B> {
                 &self.status.apps,
                 self.status.default_output == DefaultOutput::Active,
             ),
+        }
+    }
+
+    fn refresh_profiles(&mut self) {
+        match self.store.list_profile_infos() {
+            Ok(list) => self.profiles = list,
+            Err(e) => eprintln!("iara: não foi possível listar os perfis: {e}"),
+        }
+    }
+
+    /// Salva o perfil ativo agora (grava e fecha o gesto). Falha se a gravação falhar.
+    fn flush_active(&mut self) -> Result<(), String> {
+        let actions = self.tracker.flush();
+        let had_work = !actions.is_empty();
+        self.execute(actions);
+        match (&self.status.persist_error, had_work) {
+            (Some(e), true) => Err(format!("não foi possível gravar o perfil atual: {e}")),
+            _ => Ok(()),
+        }
+    }
+
+    /// Troca o perfil ativo (spec 8.4): valida o destino antes de mexer em qualquer coisa, grava o atual, herda os dispositivos
+    /// se o novo não tiver os seus (senão o sistema ficaria mudo), aplica o novo plano (o motor remove o obsoleto só depois de
+    /// os aplicativos saírem dele) e encerra as escolhas só desta sessão.
+    fn switch_profile(&mut self, id: &str, now: Instant) -> Result<(), String> {
+        if id == self.profile.id {
+            return Ok(());
+        }
+        let (mut target, _) = self
+            .store
+            .load_profile(id)
+            .map_err(|e| format!("não foi possível carregar o perfil {id}: {e}"))?;
+        plan(&target).map_err(|e| format!("perfil {id} inválido: {e:?}"))?;
+        self.flush_active()?;
+        let mut inherited = false;
+        if target.preferred_output.is_none() && self.profile.preferred_output.is_some() {
+            target.preferred_output = self.profile.preferred_output.clone();
+            inherited = true;
+        }
+        if target.preferred_microphone.is_none() && self.profile.preferred_microphone.is_some() {
+            target.preferred_microphone = self.profile.preferred_microphone.clone();
+            inherited = true;
+        }
+        self.overrides.clear();
+        self.profile = target;
+        if inherited {
+            if let Err(e) = self.store.save_profile(&self.profile) {
+                eprintln!("iara: não foi possível gravar os dispositivos herdados: {e}");
+            }
+        }
+        match self.store.load_config() {
+            Ok((mut cfg, _)) => {
+                cfg.active_profile = Some(id.to_owned());
+                if let Err(e) = self.store.save_config(&cfg) {
+                    eprintln!("iara: não foi possível gravar o perfil ativo: {e}");
+                }
+            }
+            Err(e) => eprintln!("iara: configuração ilegível ao trocar de perfil: {e}"),
+        }
+        self.apply_current(now);
+        self.sync_routes(true, now);
+        self.refresh_profiles();
+        self.changed();
+        Ok(())
+    }
+
+    /// Operações sobre perfis. Devolve o id novo (criar/duplicar) ou o do perfil ativo.
+    fn profile_op(&mut self, op: ProfileOp, now: Instant) -> Result<String, String> {
+        let ids: Vec<String> = self.profiles.iter().map(|p| p.id.clone()).collect();
+        let valid_name = |n: &str| -> Result<String, String> {
+            let n = n.trim();
+            if iara_core::is_valid_text(n, 128) {
+                Ok(n.to_owned())
+            } else {
+                Err("nome inválido (vazio, longo demais ou com caracteres de controle)".to_owned())
+            }
+        };
+        let active = self.profile.id.clone();
+        match op {
+            ProfileOp::Switch(id) => self.switch_profile(&id, now).map(|()| id),
+            ProfileOp::Create(name) => {
+                let name = valid_name(&name)?;
+                let id = iara_core::slug_id(&name, &ids)
+                    .ok_or("o nome não tem nenhum caractere aproveitável")?;
+                let mut p = initial_profile();
+                p.id = id.clone();
+                p.name = name;
+                p.preferred_output = self.profile.preferred_output.clone();
+                p.preferred_microphone = self.profile.preferred_microphone.clone();
+                self.store.save_profile(&p).map_err(|e| e.to_string())?;
+                self.refresh_profiles();
+                self.changed();
+                Ok(id)
+            }
+            ProfileOp::Duplicate { id, name } => {
+                let name = valid_name(&name)?;
+                let new_id = iara_core::slug_id(&name, &ids)
+                    .ok_or("o nome não tem nenhum caractere aproveitável")?;
+                if id == active {
+                    self.flush_active()?; // a cópia sai do estado atual, não de um autosave atrasado
+                }
+                self.store
+                    .duplicate_profile(&id, &new_id, &name)
+                    .map_err(|e| e.to_string())?;
+                self.refresh_profiles();
+                self.changed();
+                Ok(new_id)
+            }
+            ProfileOp::Rename { id, name } => {
+                let name = valid_name(&name)?;
+                if id == active {
+                    let mut next = self.profile.clone();
+                    next.name = name;
+                    self.replace_profile(
+                        next,
+                        EditKind::Structural(RevisionReason::Structural),
+                        now,
+                    );
+                } else {
+                    let (mut p, _) = self.store.load_profile(&id).map_err(|e| e.to_string())?;
+                    p.name = name;
+                    self.store.save_profile(&p).map_err(|e| e.to_string())?;
+                }
+                self.flush_active()?;
+                self.refresh_profiles();
+                self.changed();
+                Ok(active)
+            }
+            ProfileOp::Delete(id) => {
+                if id == active {
+                    return Err(
+                        "não é possível excluir o perfil ativo: troque de perfil antes".to_owned(),
+                    );
+                }
+                if ids.len() <= 1 {
+                    return Err("não é possível excluir o último perfil".to_owned());
+                }
+                self.store.trash_profile(&id).map_err(|e| e.to_string())?;
+                self.refresh_profiles();
+                self.changed();
+                Ok(active)
+            }
         }
     }
 
@@ -351,6 +503,7 @@ impl<B: Backend> Service<B> {
     }
 
     pub fn start(&mut self, now: Instant) {
+        self.refresh_profiles();
         self.try_connect(now);
     }
 
@@ -488,6 +641,12 @@ impl<B: Backend> Service<B> {
             }
             Msg::Command(Command::GetState { reply }) => {
                 let _ = reply.send(self.snapshot());
+            }
+            Msg::Command(Command::Profile { op, reply }) => {
+                let result = self.profile_op(op, now);
+                if let Some(r) = reply {
+                    let _ = r.send(result);
+                }
             }
             Msg::Command(Command::SessionChoice { key, choice, reply }) => {
                 let result = match choice {
@@ -1337,5 +1496,334 @@ mod tests {
         assert_eq!(svc.status().default_output, DefaultOutput::Disabled);
         svc.handle(Msg::Command(Command::Shutdown), t0);
         assert!(sets(&world).is_empty());
+    }
+
+    fn prof(svc: &mut Service<Fake>, op: ProfileOp, now: Instant) -> Result<String, String> {
+        let (tx, rx) = mpsc::channel();
+        svc.handle(
+            Msg::Command(Command::Profile {
+                op,
+                reply: Some(tx),
+            }),
+            now,
+        );
+        rx.try_recv().unwrap()
+    }
+
+    fn store_of(dir: &tempfile::TempDir) -> Store {
+        Store::open(dir.path().join("config"), dir.path().join("state"))
+    }
+
+    #[test]
+    fn creating_duplicating_and_listing_profiles_never_changes_the_active_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, _w) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        assert_eq!(
+            svc.snapshot()
+                .profiles
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["default"]
+        );
+        // dispositivos do ativo são herdados pelos novos (senão trocar para eles deixaria o sistema mudo)
+        let (msg, _rx) = edit(EditCommand::SetPreferredOutput(Some(FONE.into())));
+        svc.handle(msg, t0);
+        let id = prof(&mut svc, ProfileOp::Create("Jogos & Chat".into()), t0).unwrap();
+        assert_eq!(id, "jogos-chat");
+        assert_eq!(svc.profile().id, "default", "criar não troca de perfil");
+        let (created, _) = store_of(&dir).load_profile(&id).unwrap();
+        assert_eq!(created.name, "Jogos & Chat");
+        assert_eq!(
+            created
+                .preferred_output
+                .as_ref()
+                .map(|d| d.persistent_key.as_str()),
+            Some(FONE)
+        );
+        // nome repetido ganha outro id; nome sem caracteres aproveitáveis é recusado
+        assert_eq!(
+            prof(&mut svc, ProfileOp::Create("Jogos & Chat".into()), t0).unwrap(),
+            "jogos-chat-2"
+        );
+        assert!(prof(&mut svc, ProfileOp::Create("!!!".into()), t0).is_err());
+        assert!(prof(&mut svc, ProfileOp::Create("a\nb".into()), t0).is_err());
+        assert_eq!(svc.snapshot().profiles.len(), 3);
+        // duplicar o ativo copia o estado ATUAL, inclusive um ajuste que o autosave ainda não gravou
+        let mut p = svc.profile().clone();
+        p.channels[0].personal.gain = Gain::from_db(-7.0).unwrap();
+        svc.handle(set(&p, EditKind::Continuous), t0);
+        let copy = prof(
+            &mut svc,
+            ProfileOp::Duplicate {
+                id: "default".into(),
+                name: "Cópia".into(),
+            },
+            t0,
+        )
+        .unwrap();
+        let (c, _) = store_of(&dir).load_profile(&copy).unwrap();
+        assert_eq!(c.channels[0].personal.gain.db(), Some(-7.0));
+        assert_eq!((c.id.as_str(), c.name.as_str()), ("copia", "Cópia"));
+    }
+
+    #[test]
+    fn switching_saves_the_current_profile_applies_the_new_plan_and_ends_session_choices() {
+        use iara_audio::AppRouteState;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        // o perfil de destino tem um canal a mais e uma regra
+        let id = prof(&mut svc, ProfileOp::Create("Streaming".into()), t0).unwrap();
+        {
+            let store = store_of(&dir);
+            let (mut target, _) = store.load_profile(&id).unwrap();
+            target.channels.push(iara_core::Channel {
+                id: "musica".into(),
+                name: "Música".into(),
+                personal: iara_core::SendControl {
+                    enabled: true,
+                    muted: false,
+                    gain: Gain::UNITY,
+                },
+                transmission: iara_core::SendControl {
+                    enabled: false,
+                    muted: false,
+                    gain: Gain::UNITY,
+                },
+            });
+            target.rules.push(iara_core::apps::Rule {
+                matcher: iara_core::apps::AppMatcher {
+                    binary: Some("zen".into()),
+                    ..Default::default()
+                },
+                channel: "musica".into(),
+            });
+            store.save_profile(&target).unwrap();
+        }
+        // um ajuste pendente (ainda não gravado) e uma escolha só desta sessão no perfil de origem
+        let mut p = svc.profile().clone();
+        p.channels[1].personal.muted = true;
+        svc.handle(set(&p, EditKind::Continuous), t0);
+        svc.handle(
+            Msg::Engine(Event::Apps(vec![zen_report(AppRouteState::Applied)])),
+            t0,
+        );
+        let (tx, _rx) = mpsc::channel();
+        svc.handle(
+            Msg::Command(Command::SessionChoice {
+                key: "bin:zen".into(),
+                choice: SessionChoice::Channel("game".into()),
+                reply: Some(tx),
+            }),
+            t0,
+        );
+        let applied_before = world.applied.borrow().len();
+
+        assert_eq!(
+            prof(&mut svc, ProfileOp::Switch(id.clone()), t0).unwrap(),
+            id
+        );
+        let store = store_of(&dir);
+        // o perfil anterior foi gravado ANTES da troca, com o ajuste pendente
+        assert!(
+            store.load_profile("default").unwrap().0.channels[1]
+                .personal
+                .muted
+        );
+        // o grupo de ajuste do perfil anterior fechou como revisão do perfil anterior
+        assert_eq!(store.list_revisions("default").unwrap().len(), 1);
+        assert!(store.list_revisions(&id).unwrap().is_empty());
+        // ativo, persistido, aplicado e com as rotas do perfil novo (a escolha de sessão terminou)
+        assert_eq!(svc.profile().id, id);
+        assert_eq!(
+            store.load_config().unwrap().0.active_profile.as_deref(),
+            Some(id.as_str())
+        );
+        assert!(world.applied.borrow().len() > applied_before);
+        assert!(world
+            .applied
+            .borrow()
+            .last()
+            .unwrap()
+            .nodes
+            .iter()
+            .any(|n| n.name == "iara.ch.musica"));
+        assert_eq!(
+            last_route(&world, "bin:zen"),
+            Some(RouteTarget::Node("iara.ch.musica".into()))
+        );
+        assert_eq!(svc.snapshot().apps[0].source, iara_core::apps::Source::Rule);
+        // trocar para o próprio perfil ativo não faz nada
+        let n = world.applied.borrow().len();
+        assert_eq!(
+            prof(&mut svc, ProfileOp::Switch(id.clone()), t0).unwrap(),
+            id
+        );
+        assert_eq!(world.applied.borrow().len(), n);
+    }
+
+    #[test]
+    fn a_failed_switch_leaves_everything_exactly_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        let other = prof(&mut svc, ProfileOp::Create("Outro".into()), t0).unwrap();
+        std::fs::write(dir.path().join("config/profiles/outro.toml"), "lixo [").unwrap();
+        let mut p = svc.profile().clone();
+        p.microphone.global_mute = true;
+        svc.handle(set(&p, EditKind::Continuous), t0);
+        let before = svc.snapshot();
+        let applied = world.applied.borrow().len();
+        let routes = world.routes.borrow().len();
+        for bad in [other.as_str(), "nao-existe", "../x"] {
+            let err = prof(&mut svc, ProfileOp::Switch(bad.into()), t0).unwrap_err();
+            assert!(!err.is_empty(), "{bad}");
+        }
+        assert_eq!(svc.profile().id, "default");
+        assert_eq!(
+            (svc.snapshot().profile, svc.snapshot().status),
+            (before.profile, before.status)
+        );
+        assert_eq!(
+            (world.applied.borrow().len(), world.routes.borrow().len()),
+            (applied, routes)
+        );
+        // nada foi gravado nem fechado por causa da tentativa: o ajuste pendente continua pendente
+        assert!(svc.next_deadline().is_some());
+        assert_eq!(
+            store_of(&dir)
+                .load_config()
+                .unwrap()
+                .0
+                .active_profile
+                .as_deref(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn a_profile_without_devices_inherits_the_current_ones_so_the_switch_cannot_silence_the_system()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, _w) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        let id = prof(&mut svc, ProfileOp::Create("Sem dispositivo".into()), t0).unwrap();
+        // remove os dispositivos do perfil de destino em disco (um perfil importado, por exemplo)
+        let store = store_of(&dir);
+        let (mut target, _) = store.load_profile(&id).unwrap();
+        target.preferred_output = None;
+        target.preferred_microphone = None;
+        store.save_profile(&target).unwrap();
+        let (m1, _r1) = edit(EditCommand::SetPreferredOutput(Some(FONE.into())));
+        let (m2, _r2) = edit(EditCommand::SetPreferredMicrophone(Some(
+            "alsa_input.mic".into(),
+        )));
+        svc.handle(m1, t0);
+        svc.handle(m2, t0);
+        prof(&mut svc, ProfileOp::Switch(id.clone()), t0).unwrap();
+        let p = svc.profile();
+        assert_eq!(
+            p.preferred_output
+                .as_ref()
+                .map(|d| d.persistent_key.as_str()),
+            Some(FONE)
+        );
+        assert_eq!(
+            p.preferred_microphone
+                .as_ref()
+                .map(|d| d.persistent_key.as_str()),
+            Some("alsa_input.mic")
+        );
+        assert_eq!(
+            &store.load_profile(&id).unwrap().0,
+            p,
+            "a herança também foi gravada"
+        );
+        // um perfil que já tem dispositivos próprios não é sobrescrito
+        let other = prof(&mut svc, ProfileOp::Create("Com dispositivo".into()), t0).unwrap();
+        let (mut o, _) = store.load_profile(&other).unwrap();
+        o.preferred_output = Some(iara_core::DevicePreference {
+            persistent_key: "alsa_output.caixas".into(),
+        });
+        store.save_profile(&o).unwrap();
+        prof(&mut svc, ProfileOp::Switch(other), t0).unwrap();
+        assert_eq!(
+            svc.profile()
+                .preferred_output
+                .as_ref()
+                .map(|d| d.persistent_key.as_str()),
+            Some("alsa_output.caixas")
+        );
+    }
+
+    #[test]
+    fn renaming_and_deleting_follow_the_safety_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, _w) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        let other = prof(&mut svc, ProfileOp::Create("Outro".into()), t0).unwrap();
+        // renomear o ativo passa pelo caminho normal (histórico e gravação); renomear outro grava direto
+        prof(
+            &mut svc,
+            ProfileOp::Rename {
+                id: "default".into(),
+                name: "Principal".into(),
+            },
+            t0,
+        )
+        .unwrap();
+        assert_eq!(svc.profile().name, "Principal");
+        assert_eq!(
+            store_of(&dir).load_profile("default").unwrap().0.name,
+            "Principal"
+        );
+        prof(
+            &mut svc,
+            ProfileOp::Rename {
+                id: other.clone(),
+                name: "Outro nome".into(),
+            },
+            t0,
+        )
+        .unwrap();
+        assert_eq!(
+            store_of(&dir).load_profile(&other).unwrap().0.name,
+            "Outro nome"
+        );
+        assert!(prof(
+            &mut svc,
+            ProfileOp::Rename {
+                id: other.clone(),
+                name: "".into()
+            },
+            t0
+        )
+        .is_err());
+        // excluir: nunca o ativo, nunca o último; o excluído vai para a lixeira (recuperável)
+        assert!(prof(&mut svc, ProfileOp::Delete("default".into()), t0)
+            .unwrap_err()
+            .contains("ativo"));
+        prof(&mut svc, ProfileOp::Delete(other.clone()), t0).unwrap();
+        assert_eq!(
+            svc.snapshot()
+                .profiles
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["default"]
+        );
+        assert!(std::fs::read_dir(dir.path().join("state/trash"))
+            .unwrap()
+            .next()
+            .is_some());
+        assert!(prof(&mut svc, ProfileOp::Delete("default".into()), t0).is_err());
+        assert!(prof(&mut svc, ProfileOp::Delete("nao-existe".into()), t0).is_err());
     }
 }

@@ -45,9 +45,7 @@ impl Mixer {
     }
 }
 
-type StateTuple = (u64, String, bool, String, Vec<String>, u32, String, String);
-
-pub(crate) fn state_to_tuple(s: &State) -> Result<StateTuple, String> {
+pub(crate) fn state_to_tuple(s: &State) -> Result<crate::StateWire, String> {
     let toml = iara_store::profile_to_toml(&s.profile).map_err(|e| e.to_string())?;
     Ok((
         s.serial,
@@ -58,14 +56,18 @@ pub(crate) fn state_to_tuple(s: &State) -> Result<StateTuple, String> {
         s.reconnect_attempts,
         crate::apps_to_toml(&s.apps)?,
         s.default_output.as_str().to_owned(),
+        s.profiles
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone(), p.readable))
+            .collect(),
     ))
 }
 
 #[zbus::interface(name = "dev.iara.Mixer1")]
 impl Mixer {
     /// (versão, perfil em TOML, conectado ao áudio, erro de gravação ("" = nenhum), dispositivos ausentes, tentativas de reconexão,
-    /// aplicativos em TOML, saída padrão: disabled|waiting|active|released)
-    fn get_state(&self) -> fdo::Result<StateTuple> {
+    /// aplicativos em TOML, saída padrão: disabled|waiting|active|released, perfis (id, nome, legível))
+    fn get_state(&self) -> fdo::Result<crate::StateWire> {
         let s = self.controller.state().map_err(fdo::Error::Failed)?;
         state_to_tuple(&s).map_err(fdo::Error::Failed)
     }
@@ -224,6 +226,40 @@ impl Mixer {
     fn clear_app_session(&self, key: String) -> fdo::Result<u64> {
         self.controller
             .session_choice(key, crate::SessionChoice::Clear)
+            .map_err(fdo::Error::InvalidArgs)
+    }
+
+    /// Troca o perfil ativo.
+    fn switch_profile(&self, id: String) -> fdo::Result<String> {
+        self.controller
+            .profile_op(crate::ProfileOp::Switch(id))
+            .map_err(fdo::Error::InvalidArgs)
+    }
+
+    /// Cria um perfil novo (herda os dispositivos do ativo) e devolve o id; não troca para ele.
+    fn create_profile(&self, name: String) -> fdo::Result<String> {
+        self.controller
+            .profile_op(crate::ProfileOp::Create(name))
+            .map_err(fdo::Error::InvalidArgs)
+    }
+
+    /// Cópia independente de um perfil; devolve o id novo.
+    fn duplicate_profile(&self, id: String, name: String) -> fdo::Result<String> {
+        self.controller
+            .profile_op(crate::ProfileOp::Duplicate { id, name })
+            .map_err(fdo::Error::InvalidArgs)
+    }
+
+    fn rename_profile(&self, id: String, name: String) -> fdo::Result<String> {
+        self.controller
+            .profile_op(crate::ProfileOp::Rename { id, name })
+            .map_err(fdo::Error::InvalidArgs)
+    }
+
+    /// Manda o perfil para a lixeira (recuperável); o ativo e o último perfil não podem ser excluídos.
+    fn delete_profile(&self, id: String) -> fdo::Result<String> {
+        self.controller
+            .profile_op(crate::ProfileOp::Delete(id))
             .map_err(fdo::Error::InvalidArgs)
     }
 

@@ -363,6 +363,10 @@ Identidade do aplicativo: id do aplicativo (`application.id` ou, em sandbox, `pi
 
 Ao ativar, “Iara — Saída principal” (`iara.unassigned`) vira a saída padrão configurada do sistema, **somente** quando há uma saída física preferida presente e já ligada (instalar sem ela deixaria o computador mudo); na primeira execução, sem preferência, o padrão atual do sistema é adotado como saída preferida. O padrão anterior é gravado em disco antes da troca (`$XDG_STATE_HOME/iara/default-sink.toml`) para sobreviver a quedas. Se o usuário escolher outra saída depois, o Iara larga a posse (não reinstala nem restaura por cima). “Desligar mixer” (e a parada normal do serviço) restauram o anterior apenas se o padrão ainda for o do Iara. `iara-service --restore-default` desfaz uma instalação deixada por uma queda. Aplicativos sem regra que mantêm uma saída própria ficam “fora do mixer” e são sinalizados. Opção de configuração `capture_default_output` (padrão ligado) existe só para desenvolvimento e testes.
 
+### 9.4 Perfis (implementado)
+
+Operações: trocar, criar (com os canais iniciais e os dispositivos do ativo; não troca), duplicar (do estado atual, inclusive ajustes ainda não gravados), renomear e excluir (para a lixeira em `$XDG_STATE_HOME/iara/trash/`, recuperável; nunca o ativo nem o último). A troca (spec 8.4) valida o destino antes de qualquer mudança, grava o perfil atual, herda os dispositivos se o novo não tiver os seus, encerra as escolhas só desta sessão, cria os objetos novos, redireciona os aplicativos (um destino só é usado quando já tem portas de entrada) e só então remove os canais obsoletos (esperando os aplicativos saírem, no máximo 5 s). Medido: 0 fluxos na saída física durante trocas repetidas. A janela tem um menu no cabeçalho com a lista de perfis, o ativo marcado, e criar/duplicar/renomear/excluir (exclusão em duas etapas).
+
 ## 10. Requisitos de qualidade
 
 - Restaurar escolhas após reinício e mudanças de ordem de abertura dos aplicativos.
@@ -491,3 +495,4 @@ Consultadas em 05/10/2026. Fundamentam capacidades existentes; os comportamentos
 - **0.10.7 — 05/10/2026:** primeira janela GTK4 sobre o IPC (9.1), com modelo de apresentação testado e verificação visual por captura gerada pela própria janela; ID de aplicação GTK definido.
 - **0.10.8 — 05/10/2026:** aplicativos implementados (9.2): inventário de fluxos, regras com precedência, roteamento por metadata confirmado por links reais, escolha só desta sessão, remoção de canal com destino das regras, etiquetas na janela.
 - **0.10.9 — 05/10/2026:** saída padrão do sistema (9.3): instalação condicionada a uma saída física presente, anterior gravado em disco, posse largada se o usuário trocar, restauração ao desligar e `--restore-default`; encerramento do motor com descarga.
+- **0.10.10 — 05/10/2026:** perfis (9.4): trocar, criar, duplicar, renomear e excluir (lixeira); troca sem vazamento para a saída física, com remoção diferida de canais obsoletos e destino só quando tem portas de entrada.

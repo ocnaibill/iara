@@ -2,8 +2,8 @@
 use iara_core::edit::{self, EditCommand, MicSend, SendKind};
 use iara_core::{initial_profile, Gain, Profile};
 use iara_ipc::{
-    serve, AppEntry, AppSource, AppState, Client, ClientError, Controller, DefaultOutput, Server,
-    SessionChoice, State,
+    serve, AppEntry, AppSource, AppState, Client, ClientError, Controller, DefaultOutput,
+    ProfileEntry, ProfileOp, Server, SessionChoice, State,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,7 @@ struct Fake {
     inner: Mutex<(Profile, u64)>,
     notifier: Mutex<Option<iara_ipc::Notifier>>,
     sessions: Mutex<Vec<(String, SessionChoice)>>,
+    profile_ops: Mutex<Vec<ProfileOp>>,
 }
 
 impl Controller for Fake {
@@ -37,7 +38,35 @@ impl Controller for Fake {
                 streams: 2,
             }],
             default_output: DefaultOutput::Released,
+            profiles: vec![
+                ProfileEntry {
+                    id: "default".into(),
+                    name: "Padrão".into(),
+                    readable: true,
+                },
+                ProfileEntry {
+                    id: "quebrado".into(),
+                    name: "quebrado".into(),
+                    readable: false,
+                },
+            ],
         })
+    }
+
+    fn profile_op(&self, op: ProfileOp) -> Result<String, String> {
+        if let ProfileOp::Switch(id) = &op {
+            if id == "nao-existe" {
+                return Err("perfil desconhecido".into());
+            }
+        }
+        let id = match &op {
+            ProfileOp::Create(n) | ProfileOp::Duplicate { name: n, .. } => format!("novo-{n}"),
+            ProfileOp::Switch(i) | ProfileOp::Delete(i) | ProfileOp::Rename { id: i, .. } => {
+                i.clone()
+            }
+        };
+        self.profile_ops.lock().unwrap().push(op);
+        Ok(id)
     }
 
     fn deactivate(&self) -> Result<(), String> {
@@ -93,6 +122,7 @@ fn start() -> Option<(String, Arc<Fake>, Server)> {
         inner: Mutex::new((initial_profile(), 1)),
         notifier: Mutex::new(None),
         sessions: Mutex::new(Vec::new()),
+        profile_ops: Mutex::new(Vec::new()),
     });
     let server = serve(&name, fake.clone()).expect("serve");
     *fake.notifier.lock().unwrap() = Some(server.notifier());
@@ -355,4 +385,48 @@ fn the_default_output_status_and_deactivate_travel_over_the_wire() {
         assert_eq!(DefaultOutput::parse(d.as_str()), Some(d));
     }
     assert_eq!(DefaultOutput::parse("???"), None);
+}
+
+#[test]
+fn profiles_travel_in_the_state_and_every_profile_operation_reaches_the_service() {
+    let Some((name, fake, _server)) = start() else {
+        return;
+    };
+    let client = Client::connect(name).unwrap();
+    let st = client.state().unwrap();
+    assert_eq!(st.profiles.len(), 2);
+    assert!(st.profiles[0].readable && !st.profiles[1].readable);
+    assert_eq!(
+        client
+            .profile_op(&ProfileOp::Switch("jogos".into()))
+            .unwrap(),
+        "jogos"
+    );
+    assert_eq!(
+        client
+            .profile_op(&ProfileOp::Create("Novo".into()))
+            .unwrap(),
+        "novo-Novo"
+    );
+    assert_eq!(
+        client
+            .profile_op(&ProfileOp::Duplicate {
+                id: "a".into(),
+                name: "Cópia".into()
+            })
+            .unwrap(),
+        "novo-Cópia"
+    );
+    client
+        .profile_op(&ProfileOp::Rename {
+            id: "a".into(),
+            name: "B".into(),
+        })
+        .unwrap();
+    client.profile_op(&ProfileOp::Delete("a".into())).unwrap();
+    assert_eq!(fake.profile_ops.lock().unwrap().len(), 5);
+    assert!(matches!(
+        client.profile_op(&ProfileOp::Switch("nao-existe".into())),
+        Err(ClientError::Rejected(m)) if m.contains("desconhecido")
+    ));
 }

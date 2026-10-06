@@ -5,7 +5,7 @@ use crate::apps::AppView;
 use crate::service::{Command, Msg, Snapshot};
 use iara_core::apps::Source;
 use iara_core::edit::EditCommand;
-use iara_ipc::{AppEntry, AppSource, Controller, SessionChoice, State};
+use iara_ipc::{AppEntry, AppSource, Controller, ProfileEntry, ProfileOp, SessionChoice, State};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -44,6 +44,15 @@ pub fn to_state(s: Snapshot) -> State {
     State {
         apps: s.apps.into_iter().map(entry).collect(),
         default_output: s.status.default_output,
+        profiles: s
+            .profiles
+            .into_iter()
+            .map(|p| ProfileEntry {
+                id: p.id,
+                name: p.name,
+                readable: p.readable,
+            })
+            .collect(),
         serial: s.serial,
         profile: s.profile,
         connected: s.status.connected,
@@ -70,6 +79,18 @@ impl Controller for ServiceController {
             .send(Msg::Command(Command::SessionChoice {
                 key,
                 choice,
+                reply: Some(reply),
+            }))
+            .map_err(|_| "serviço encerrando".to_owned())?;
+        rx.recv_timeout(REPLY_TIMEOUT)
+            .map_err(|_| "o serviço não respondeu a tempo".to_owned())?
+    }
+
+    fn profile_op(&self, op: ProfileOp) -> Result<String, String> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Msg::Command(Command::Profile {
+                op,
                 reply: Some(reply),
             }))
             .map_err(|_| "serviço encerrando".to_owned())?;

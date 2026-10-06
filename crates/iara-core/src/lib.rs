@@ -17,6 +17,43 @@ pub fn is_valid_id(id: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
+/// Id lógico a partir de um nome digitado: minúsculas ASCII, dígitos, `-` e `_`; único entre `existing`. `None` se o nome
+/// não tiver nenhum caractere aproveitável.
+pub fn slug_id(name: &str, existing: &[String]) -> Option<String> {
+    let mut base = String::new();
+    for ch in name.chars().flat_map(char::to_lowercase) {
+        let ch = match ch {
+            'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+            'é' | 'ê' | 'è' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            c => c,
+        };
+        if ch.is_ascii_alphanumeric() {
+            base.push(ch);
+        } else if matches!(ch, ' ' | '-' | '_') && !base.is_empty() && !base.ends_with('-') {
+            base.push('-');
+        }
+    }
+    let base = base
+        .trim_end_matches('-')
+        .chars()
+        .take(24)
+        .collect::<String>();
+    if base.is_empty() {
+        return None;
+    }
+    let mut id = base.clone();
+    let mut n = 1;
+    while existing.contains(&id) {
+        n += 1;
+        id = format!("{base}-{n}");
+    }
+    is_valid_id(&id).then_some(id)
+}
+
 /// Chave de dispositivo/texto livre: sem caracteres de controle e de tamanho razoável.
 pub fn is_valid_text(text: &str, max_len: usize) -> bool {
     !text.is_empty() && text.len() <= max_len && !text.chars().any(char::is_control)
@@ -229,6 +266,21 @@ mod tests {
         assert_eq!(mic.effective_amplitudes(), [0.1, 0.0, 1.0]);
         mic.global_mute = true;
         assert_eq!(mic.effective_amplitudes(), [0.0; 3]);
+    }
+
+    #[test]
+    fn slugs_are_safe_unique_ids_from_names() {
+        let none: Vec<String> = vec![];
+        assert_eq!(slug_id("Música", &none).as_deref(), Some("musica"));
+        assert_eq!(
+            slug_id("  Vídeo  Chamada! ", &none).as_deref(),
+            Some("video-chamada")
+        );
+        assert_eq!(slug_id("a/b\\c", &none).as_deref(), Some("abc"));
+        assert_eq!(slug_id("!!!", &none), None);
+        let taken = vec!["game".to_owned(), "game-2".to_owned()];
+        assert_eq!(slug_id("GAME", &taken).as_deref(), Some("game-3"));
+        assert!(is_valid_id(&slug_id(&"x".repeat(80), &none).unwrap()));
     }
 
     #[test]

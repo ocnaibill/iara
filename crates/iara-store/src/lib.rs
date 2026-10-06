@@ -127,6 +127,14 @@ fn parse_default_sink(text: &str) -> Result<DefaultSinkState, StoreError> {
     Ok(st)
 }
 
+/// Perfil na lista: id, nome e se o arquivo foi lido sem erro (um ilegível aparece, para o usuário poder tratá-lo).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileInfo {
+    pub id: String,
+    pub name: String,
+    pub readable: bool,
+}
+
 pub struct Store {
     config_dir: PathBuf,
     state_dir: PathBuf,
@@ -354,6 +362,51 @@ impl Store {
         }
         ids.sort();
         Ok(ids)
+    }
+
+    /// Perfis com seus nomes, por id; um ilegível aparece com o id no lugar do nome.
+    pub fn list_profile_infos(&self) -> Result<Vec<ProfileInfo>, StoreError> {
+        Ok(self
+            .list_profiles()?
+            .into_iter()
+            .map(|id| match self.load_profile(&id) {
+                Ok((p, _)) => ProfileInfo {
+                    id,
+                    name: p.name,
+                    readable: true,
+                },
+                Err(_) => ProfileInfo {
+                    name: id.clone(),
+                    id,
+                    readable: false,
+                },
+            })
+            .collect())
+    }
+
+    /// Move o perfil (arquivo, cópia e histórico) para a lixeira em `$XDG_STATE_HOME/iara/trash/<id>-<unix>/` em vez de
+    /// apagar: excluir um perfil não deve ser irreversível. Devolve a pasta da lixeira.
+    pub fn trash_profile(&self, id: &str) -> Result<PathBuf, StoreError> {
+        require_id(id)?;
+        let file = self.profile_file(id);
+        if !file.exists() {
+            return Err(StoreError::NotFound(id.to_owned()));
+        }
+        let dest = self
+            .state_dir
+            .join("trash")
+            .join(format!("{id}-{}", now_unix()));
+        fs::create_dir_all(&dest)?;
+        fs::rename(&file, dest.join(format!("{id}.toml")))?;
+        let bak = backup_path(&file);
+        if bak.exists() {
+            fs::rename(&bak, dest.join(format!("{id}.toml.bak")))?;
+        }
+        let history = self.history_dir(id);
+        if history.exists() {
+            fs::rename(&history, dest.join("history"))?;
+        }
+        Ok(dest)
     }
 
     pub fn load_profile(&self, id: &str) -> Result<(Profile, LoadStatus), StoreError> {
@@ -850,6 +903,52 @@ mod tests {
         assert_eq!(s.load_config().unwrap().0, cfg);
         cfg.active_profile = Some("../x".into());
         assert!(s.save_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn profile_infos_list_names_and_flag_unreadable_files() {
+        let (_d, s) = store();
+        let mut p = initial_profile();
+        p.name = "Streaming".into();
+        s.save_profile(&p).unwrap();
+        s.duplicate_profile("default", "outro", "Outro").unwrap();
+        fs::write(s.profile_file("outro"), "lixo [").unwrap();
+        let infos = s.list_profile_infos().unwrap();
+        assert_eq!(infos.len(), 2);
+        let by = |id: &str| infos.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(
+            (by("default").name.as_str(), by("default").readable),
+            ("Streaming", true)
+        );
+        assert_eq!(
+            (by("outro").name.as_str(), by("outro").readable),
+            ("outro", false)
+        );
+    }
+
+    #[test]
+    fn trashing_a_profile_is_recoverable_and_takes_the_history_with_it() {
+        let (d, s) = store();
+        let p = initial_profile();
+        s.save_profile(&p).unwrap();
+        s.save_profile(&p).unwrap();
+        s.push_revision(&p, RevisionReason::Structural).unwrap();
+        let dest = s.trash_profile("default").unwrap();
+        assert!(s.list_profiles().unwrap().is_empty());
+        assert!(s.list_revisions("default").unwrap().is_empty());
+        assert!(dest.starts_with(d.path().join("state/trash")));
+        // recuperável: o arquivo e o histórico estão intactos na lixeira
+        let text = fs::read_to_string(dest.join("default.toml")).unwrap();
+        assert_eq!(parse_profile(&text).unwrap(), p);
+        assert!(dest.join("default.toml.bak").exists() && dest.join("history").is_dir());
+        assert!(matches!(
+            s.trash_profile("default"),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            s.trash_profile("../x"),
+            Err(StoreError::Invalid(_))
+        ));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use iara_core::edit::EditCommand;
 use iara_core::{chatmix, Gain, Profile, SendControl};
-use iara_ipc::{AppEntry, AppSource, AppState, DefaultOutput, SessionChoice, State};
+use iara_ipc::{AppEntry, AppSource, AppState, DefaultOutput, ProfileOp, SessionChoice, State};
 
 /// Menor posição positiva do slider: p = 0 é silêncio exato; qualquer p > 0 é um ganho de −60 a 0 dB (spec 5).
 pub const MIN_POSITION: f64 = 1e-6;
@@ -204,7 +204,7 @@ pub fn coalesce(commands: Vec<EditCommand>) -> Vec<EditCommand> {
 pub fn coalesce_ui(commands: Vec<UiCommand>) -> Vec<UiCommand> {
     coalesce_by(commands, |c| match c {
         UiCommand::Edit(e) => coalesce_key(e),
-        UiCommand::Session { .. } | UiCommand::Deactivate => None,
+        UiCommand::Session { .. } | UiCommand::Deactivate | UiCommand::Profile(_) => None,
     })
 }
 
@@ -291,6 +291,8 @@ pub enum UiCommand {
     Edit(EditCommand),
     /// “Desligar mixer / voltar ao áudio normal”: restaura a saída padrão anterior e encerra o serviço.
     Deactivate,
+    /// Trocar, criar, duplicar, renomear ou excluir perfis.
+    Profile(ProfileOp),
     Session {
         key: String,
         choice: SessionChoice,
@@ -321,6 +323,47 @@ pub fn reapply_rule(app: &AppEntry) -> Option<UiCommand> {
         key: app.key.clone()?,
         choice: SessionChoice::Clear,
     })
+}
+
+/// Linha do menu de perfis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileRow {
+    pub id: String,
+    pub label: String,
+    pub active: bool,
+    /// Trocar para ele é possível (legível e não é o ativo).
+    pub can_switch: bool,
+    /// Excluir é possível (não é o ativo e não é o único).
+    pub can_delete: bool,
+}
+
+/// Texto do botão do cabeçalho: o nome do perfil ativo (o botão já desenha a própria seta).
+pub fn active_profile_label(state: &State) -> String {
+    state.profile.name.clone()
+}
+
+pub fn profile_rows(state: &State) -> Vec<ProfileRow> {
+    let active = &state.profile.id;
+    let only_one = state.profiles.len() <= 1;
+    state
+        .profiles
+        .iter()
+        .map(|p| {
+            let is_active = &p.id == active;
+            let label = match (is_active, p.readable) {
+                (true, _) => format!("● {}", p.name),
+                (false, true) => p.name.clone(),
+                (false, false) => format!("⚠ {} (ilegível)", p.name),
+            };
+            ProfileRow {
+                id: p.id.clone(),
+                label,
+                active: is_active,
+                can_switch: !is_active && p.readable,
+                can_delete: !is_active && !only_one,
+            }
+        })
+        .collect()
 }
 
 /// Etiqueta de aplicativo dentro de uma coluna.
@@ -398,43 +441,6 @@ pub fn chips_by_column(state: &State) -> std::collections::HashMap<String, Vec<A
     out
 }
 
-/// Id lógico a partir de um nome digitado: minúsculas ASCII, dígitos, `-` e `_`; único entre `existing`. `None` se o nome
-/// não tiver nenhum caractere aproveitável.
-pub fn slug(name: &str, existing: &[String]) -> Option<String> {
-    let mut base = String::new();
-    for ch in name.chars().flat_map(char::to_lowercase) {
-        let ch = match ch {
-            'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
-            'é' | 'ê' | 'è' | 'ë' => 'e',
-            'í' | 'ì' | 'î' | 'ï' => 'i',
-            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
-            'ú' | 'ù' | 'û' | 'ü' => 'u',
-            'ç' => 'c',
-            c => c,
-        };
-        if ch.is_ascii_alphanumeric() {
-            base.push(ch);
-        } else if matches!(ch, ' ' | '-' | '_') && !base.is_empty() && !base.ends_with('-') {
-            base.push('-');
-        }
-    }
-    let base = base
-        .trim_end_matches('-')
-        .chars()
-        .take(24)
-        .collect::<String>();
-    if base.is_empty() {
-        return None;
-    }
-    let mut id = base.clone();
-    let mut n = 1;
-    while existing.contains(&id) {
-        n += 1;
-        id = format!("{base}-{n}");
-    }
-    iara_core::is_valid_id(&id).then_some(id)
-}
-
 /// Texto para "não consegui falar com o serviço": o caso comum (serviço parado) em linguagem simples; o resto, com o detalhe.
 pub fn unavailable_text(detail: &str) -> String {
     let lower = detail.to_lowercase();
@@ -446,6 +452,11 @@ pub fn unavailable_text(detail: &str) -> String {
     } else {
         format!("Sem conexão com o serviço do Iara: {detail}")
     }
+}
+
+/// Id lógico a partir de um nome digitado (ver `iara_core::slug_id`).
+pub fn slug(name: &str, existing: &[String]) -> Option<String> {
+    iara_core::slug_id(name, existing)
 }
 
 #[cfg(test)]
@@ -464,6 +475,7 @@ mod tests {
             reconnect_attempts: 0,
             apps: vec![],
             default_output: DefaultOutput::Active,
+            profiles: vec![],
         }
     }
 
@@ -878,5 +890,39 @@ mod tests {
         assert!(
             chip.tooltip.contains("fora do mixer") && chip.tooltip.contains("associe a um canal")
         );
+    }
+
+    #[test]
+    fn the_profile_menu_marks_the_active_one_and_only_offers_safe_actions() {
+        use iara_ipc::ProfileEntry;
+        let mut s = state(initial_profile());
+        let pe = |id: &str, name: &str, readable: bool| ProfileEntry {
+            id: id.into(),
+            name: name.into(),
+            readable,
+        };
+        s.profiles = vec![
+            pe("default", "Padrão", true),
+            pe("jogos", "Jogos", true),
+            pe("quebrado", "quebrado", false),
+        ];
+        assert_eq!(active_profile_label(&s), "Padrão");
+        let rows = profile_rows(&s);
+        assert_eq!(rows[0].label, "● Padrão");
+        assert_eq!(
+            (rows[0].can_switch, rows[0].can_delete),
+            (false, false),
+            "o ativo não troca nem se exclui"
+        );
+        assert_eq!((rows[1].can_switch, rows[1].can_delete), (true, true));
+        assert_eq!(rows[2].label, "⚠ quebrado (ilegível)");
+        assert_eq!(
+            (rows[2].can_switch, rows[2].can_delete),
+            (false, true),
+            "ilegível não vira ativo, mas pode ir para a lixeira"
+        );
+        // o único perfil não pode ser excluído
+        s.profiles = vec![pe("default", "Padrão", true)];
+        assert!(!profile_rows(&s)[0].can_delete);
     }
 }

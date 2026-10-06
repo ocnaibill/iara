@@ -257,6 +257,9 @@ struct State {
     nodes_present: HashMap<u32, String>,
     /// Fluxos de reprodução de aplicativos (não os do Iara), por id do nó.
     streams: HashMap<u32, StreamMeta>,
+    /// Portas do grafo: id → (nó dono, é entrada). Um sink só é destino possível quando tem portas de entrada: antes disso o
+    /// WirePlumber não consegue ligar o fluxo a ele e o joga na saída padrão (vazamento breve, medido na prova 19).
+    ports: HashMap<u32, (u32, bool)>,
     /// Links do grafo: id → (nó de saída, nó de entrada).
     links: HashMap<u32, (u32, u32)>,
     /// Metadata `default` (onde se define o destino de cada fluxo) e seu id global.
@@ -469,7 +472,19 @@ fn observe_streams(st: &State) -> Vec<StreamObs> {
 fn reconcile_routes(st: &mut State, ev: &EventSink) {
     let now = Instant::now();
     let streams = observe_streams(st);
-    let present: HashSet<String> = st.nodes_present.values().cloned().collect();
+    // destinos prontos: nós com ao menos uma porta de entrada registrada
+    let with_input: HashSet<u32> = st
+        .ports
+        .values()
+        .filter(|(_, is_in)| *is_in)
+        .map(|(n, _)| *n)
+        .collect();
+    let present: HashSet<String> = st
+        .nodes_present
+        .iter()
+        .filter(|(id, _)| with_input.contains(id))
+        .map(|(_, n)| n.clone())
+        .collect();
     for a in routing::pending_actions(&streams, &st.routes, &st.attempts, &present) {
         if a.send {
             let Some((_, meta)) = st.metadata.as_ref() else {
@@ -643,6 +658,16 @@ fn run(
                         }
                         return;
                     }
+                    ObjectType::Port => {
+                        let node = props
+                            .and_then(|p| p.get("node.id"))
+                            .and_then(|v| v.parse::<u32>().ok());
+                        let is_in = props.and_then(|p| p.get("port.direction")) == Some("in");
+                        if let Some(n) = node {
+                            st_add.borrow_mut().ports.insert(g.id, (n, is_in));
+                        }
+                        return;
+                    }
                     ObjectType::Metadata => {
                         if props.and_then(|p| p.get("metadata.name")) == Some("default") {
                             if let Ok(m) = reg.bind::<pw::metadata::Metadata, _>(g) {
@@ -786,6 +811,7 @@ fn run(
                 st.streams.remove(&id);
                 st.stream_nodes.remove(&id);
                 st.links.remove(&id);
+                st.ports.remove(&id);
                 st.attempts.remove(&id);
                 if st.metadata.as_ref().is_some_and(|(mid, _)| *mid == id) {
                     st.metadata = None;

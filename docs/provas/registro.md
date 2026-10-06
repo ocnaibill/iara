@@ -339,6 +339,36 @@ restauração não acontecia (`--restore-default` falhou numa rodada e passou no
 Limites: ao trocar a saída padrão, aplicativos que seguem o padrão são movidos pelo WirePlumber e podem ter pequenos cortes. No fim das rodadas o Cider (Electron) estava
 sem fluxo de áudio aberto; não se estabeleceu se foi pausa natural ou efeito das trocas (issue aberta). Não testado: queda do PipeWire com o Iara como padrão.
 
+## Prova 18 e 19 — troca de perfil sem vazamento (spec 8.4)
+
+Scripts: `tools/provas/18-troca-sem-vazamento.sh` (motor: remoção de canal com aplicativo nele, com controle) e `tools/provas/19-troca-de-perfil-e2e.sh`
+(serviço + D-Bus + PipeWire reais; captura da saída padrão desligada; só fluxos de teste `IaraTeste*`). Os links dos fluxos são amostrados a cada ~25 ms.
+
+**18 — remoção diferida.** O motor remove canais obsoletos só depois de os aplicativos saírem deles (prazo máximo de 5 s), em vez de destruí-los no `apply`.
+Fluxo com destino explícito no canal removido, janela de 1 s até o redirecionamento: **com** a espera 46 amostras no canal velho e 0 na saída física; **sem**
+a espera (controle) 27 amostras na saída física, ou seja, o vazamento é real e a espera o evita. (Para fluxos movidos por metadata e redirecionados em 50 ms o
+controle não vaza: o teste só discrimina com a janela maior.)
+
+**19 — troca de perfil.** Perfil `padrão` (A→aux, B→game) e `copia` (sem aux; A→game). Duplicar, trocar, remover canal na cópia, voltar, e depois 4 trocas seguidas.
+
+| Verificação | Resultado |
+| --- | --- |
+| Canais no grafo após cada troca | acompanham o perfil ativo (aux some e volta) |
+| Fluxos na saída física durante 4 trocas (~725 amostras) | **0** (3 rodadas); antes da correção abaixo, 4 de 4 rodadas tinham de 2 a 6 amostras |
+| Trocar para perfil inexistente / ilegível | erro com motivo; perfil, estado, rotas e gravações **intactos** |
+| Excluir o perfil ativo | recusado; o último perfil também; excluir outro vai para a lixeira (recuperável) |
+| Perfil ativo | persistido em `config.toml` |
+
+Defeito encontrado e corrigido: ~35–70 ms de vazamento ao mover um fluxo para um canal **recém-criado**: o motor tratava o destino como pronto assim que o nó aparecia no
+registro, mas o WirePlumber ainda não conseguia ligá-lo (as **portas de entrada** aparecem depois) e usava a saída padrão. O destino agora só vale quando tem ao menos uma porta de entrada.
+
+Regras da troca (serviço): valida o destino antes de mexer em qualquer coisa; grava o perfil atual e fecha o gesto de histórico dele antes; herda os dispositivos do perfil
+anterior se o novo não tiver os seus (senão o sistema ficaria mudo); encerra as escolhas só desta sessão; só então aplica o plano e reenvia as rotas. Criar não troca de perfil;
+duplicar o ativo copia o estado atual, inclusive ajustes ainda não gravados.
+
+Limites: o menu de perfis da janela foi compilado e visto na captura do cabeçalho, mas o popover e os cliques não foram exercitados com entrada real; importar/exportar
+perfis e restaurar revisões ainda não têm comando no IPC nem interface.
+
 ### O que isto NÃO prova
 
 - Medições longas (horas), CPU com medidores de nível ativos e com efeitos; o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.
