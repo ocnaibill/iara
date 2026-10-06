@@ -45,7 +45,7 @@ impl Mixer {
     }
 }
 
-type StateTuple = (u64, String, bool, String, Vec<String>, u32, String);
+type StateTuple = (u64, String, bool, String, Vec<String>, u32, String, String);
 
 pub(crate) fn state_to_tuple(s: &State) -> Result<StateTuple, String> {
     let toml = iara_store::profile_to_toml(&s.profile).map_err(|e| e.to_string())?;
@@ -57,13 +57,14 @@ pub(crate) fn state_to_tuple(s: &State) -> Result<StateTuple, String> {
         s.absent_devices.clone(),
         s.reconnect_attempts,
         crate::apps_to_toml(&s.apps)?,
+        s.default_output.as_str().to_owned(),
     ))
 }
 
 #[zbus::interface(name = "dev.iara.Mixer1")]
 impl Mixer {
     /// (versão, perfil em TOML, conectado ao áudio, erro de gravação ("" = nenhum), dispositivos ausentes, tentativas de reconexão,
-    /// aplicativos em TOML)
+    /// aplicativos em TOML, saída padrão: disabled|waiting|active|released)
     fn get_state(&self) -> fdo::Result<StateTuple> {
         let s = self.controller.state().map_err(fdo::Error::Failed)?;
         state_to_tuple(&s).map_err(fdo::Error::Failed)
@@ -224,6 +225,11 @@ impl Mixer {
         self.controller
             .session_choice(key, crate::SessionChoice::Clear)
             .map_err(fdo::Error::InvalidArgs)
+    }
+
+    /// “Desligar mixer / voltar ao áudio normal”: restaura a saída padrão anterior (se ainda for a do Iara) e encerra o serviço.
+    fn deactivate(&self) -> fdo::Result<()> {
+        self.controller.deactivate().map_err(fdo::Error::Failed)
     }
 
     /// O retrato mudou (perfil ou status); releia com `GetState`.

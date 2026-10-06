@@ -90,15 +90,17 @@ impl Client {
     }
 
     pub fn state(&self) -> Result<State, ClientError> {
-        let (serial, toml, connected, persist_error, absent_devices, reconnect_attempts, apps): (
-            u64,
-            String,
-            bool,
-            String,
-            Vec<String>,
-            u32,
-            String,
-        ) = self.proxy.call("GetState", &())?;
+        let (
+            serial,
+            toml,
+            connected,
+            persist_error,
+            absent_devices,
+            reconnect_attempts,
+            apps,
+            default_output,
+        ): (u64, String, bool, String, Vec<String>, u32, String, String) =
+            self.proxy.call("GetState", &())?;
         let apps = crate::apps_from_toml(&apps).map_err(ClientError::Rejected)?;
         let profile = iara_store::profile_from_toml(&toml)
             .map_err(|e| ClientError::Rejected(e.to_string()))?;
@@ -110,6 +112,7 @@ impl Client {
             absent_devices,
             reconnect_attempts,
             apps,
+            default_output: crate::DefaultOutput::parse(&default_output).unwrap_or_default(),
         })
     }
 
@@ -193,6 +196,18 @@ impl Client {
             crate::SessionChoice::Unassigned => p.call("SetAppSession", &(key, ""))?,
             crate::SessionChoice::Clear => p.call("ClearAppSession", &(key,))?,
         })
+    }
+
+    /// “Desligar mixer / voltar ao áudio normal”: o serviço restaura a saída padrão anterior e encerra.
+    pub fn deactivate(&self) -> Result<(), ClientError> {
+        match self.proxy.call::<_, _, ()>("Deactivate", &()) {
+            Ok(()) => Ok(()),
+            // o serviço encerra logo após responder: se ele sumiu antes de a resposta chegar, o resultado desejado foi alcançado
+            Err(e) => match ClientError::from(e) {
+                ClientError::Unavailable(_) => Ok(()),
+                other => Err(other),
+            },
+        }
     }
 
     /// Assina o sinal `Changed`. Crie a assinatura ANTES de agir se não puder perder avisos; ela vive até o fim do processo

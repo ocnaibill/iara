@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+fn yes() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SendDto {
@@ -252,6 +256,10 @@ pub struct GlobalConfig {
     pub share_output_device: bool,
     /// Compartilhar o microfone físico escolhido entre todos os perfis.
     pub share_microphone_device: bool,
+    /// Ao ativar o mixer, tornar “Iara — Saída principal” a saída padrão do sistema (spec 8.2). Desligável só para
+    /// desenvolvimento e testes; o produto liga por padrão.
+    #[serde(default = "yes")]
+    pub capture_default_output: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_output_device: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,6 +274,7 @@ impl Default for GlobalConfig {
             autostart: true,
             share_output_device: false,
             share_microphone_device: false,
+            capture_default_output: true,
             shared_output_device: None,
             shared_microphone_device: None,
         }

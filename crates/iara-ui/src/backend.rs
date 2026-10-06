@@ -94,6 +94,7 @@ fn commands(name: &str, rx: mpsc::Receiver<UiCommand>, on_update: &OnUpdate) {
             let result = match &cmd {
                 UiCommand::Edit(e) => c.edit(e),
                 UiCommand::Session { key, choice } => c.session_choice(key, choice),
+                UiCommand::Deactivate => c.deactivate().map(|()| 0),
             };
             match result {
                 Ok(_) => {}

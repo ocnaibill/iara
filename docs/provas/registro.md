@@ -311,6 +311,34 @@ no destino e não briga com mudanças externas.
 Limites: arrastar e soltar e o menu "Mover para…" **não foram exercitados com entrada real** (só compilados e vistos em captura); unassigned só é capturado
 quando a saída padrão do sistema for a do Iara (issue #9); aplicativo com identidade só por `name` pode trocar de chave durante a vida do fluxo.
 
+## Prova 16 e 17 — saída padrão do sistema (issue #9)
+
+Scripts: `tools/provas/16-saida-padrao-e2e.sh` (cenário completo contra o PipeWire **real**, com rede de segurança que devolve o padrão original) e
+`17-restauracao-repetida.sh` (regressão: instalar, `kill -9`, `--restore-default`, N vezes). O padrão original era `alsa_output.pci-0000_0b_00.4.analog-stereo`.
+
+| Etapa | Resultado |
+| --- | --- |
+| Primeira execução, sem saída preferida | padrão do sistema → `iara.unassigned`; o padrão anterior vira a saída preferida do perfil; anterior gravado em disco **antes** da troca; aplicativos reais (Zen, Cider) que seguem o padrão passam a sair pelo Iara |
+| Aplicativo novo, sem regra | entra por `iara.unassigned` (estado "aplicado") |
+| Aplicativo com saída própria (`--target`) | permanece na saída física; estado `outside` ("fora do mixer") |
+| `AssignApp` do aplicativo novo | passa ao canal; regra salva |
+| `kill -9` no serviço | padrão fica em `iara.unassigned`; registro continua em disco |
+| `iara-service --restore-default` | padrão volta ao original, registro apagado, aplicativos voltam à saída física |
+| Reinstalar e o usuário escolher o original | `released`; registro apagado; reinstalação não acontece |
+| "Desligar mixer" com posse largada | não altera a escolha do usuário |
+| "Desligar mixer" com posse | restaura o original; 0 nós `iara.*` |
+| Regressão (17) | 6 de 6 |
+
+Defeitos encontrados e corrigidos neste ciclo: (1) a decisão "há saída física pronta" usava a lista de ausentes do relatório de `apply`, que fica velha
+(instalaria com o dispositivo ausente, deixando o sistema mudo, ou não instalaria depois de ele voltar) — a lista agora é única (relatório + eventos), com teste;
+(2) **intermitente**: ao encerrar o motor logo depois de enviar a saída padrão restaurada, o processo podia sair com a mensagem ainda no buffer da conexão e a
+restauração não acontecia (`--restore-default` falhou numa rodada e passou noutra); o encerramento agora faz uma ida-e-volta (`core.sync`) com prazo de 1 s; (3) o
+`Deactivate` D-Bus terminava com "Remote peer disconnected" porque o serviço saía antes de a resposta ser entregue — agora há um instante de graça e o cliente trata
+"o serviço sumiu" como sucesso.
+
+Limites: ao trocar a saída padrão, aplicativos que seguem o padrão são movidos pelo WirePlumber e podem ter pequenos cortes. No fim das rodadas o Cider (Electron) estava
+sem fluxo de áudio aberto; não se estabeleceu se foi pausa natural ou efeito das trocas (issue aberta). Não testado: queda do PipeWire com o Iara como padrão.
+
 ### O que isto NÃO prova
 
 - Medições longas (horas), CPU com medidores de nível ativos e com efeitos; o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.

@@ -3,11 +3,13 @@
 //! O tempo entra por parâmetro (`handle`, `tick`) para testar sem dormir; `run` liga ao relógio real.
 
 use crate::apps::{self, AppView, Overrides};
+use crate::default_sink::{Effect, Policy, INSTALLED};
 use crate::tracker::{Action, EditKind, EditTracker};
 use iara_audio::{AppReport, ApplyReport, Engine, EngineError, Event, EventSink, RouteTarget};
 use iara_core::edit::{self, EditClass, EditCommand};
 use iara_core::topology::{plan, Plan};
 use iara_core::{initial_profile, Profile};
+use iara_ipc::DefaultOutput;
 use iara_store::{GlobalConfig, RevisionReason, Store, StoreError};
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -26,6 +28,8 @@ pub trait Backend {
     fn apply(&mut self, plan: Plan) -> Result<ApplyReport, EngineError>;
     /// Para onde cada aplicativo (chave de identidade) deve ir; o resultado volta como `Event::Apps`.
     fn set_routes(&mut self, routes: HashMap<String, RouteTarget>) -> Result<(), EngineError>;
+    /// Define (ou apaga, com `None`) a saída padrão configurada do sistema.
+    fn set_default_sink(&mut self, name: Option<String>) -> Result<(), EngineError>;
 }
 
 impl Backend for Engine {
@@ -35,6 +39,10 @@ impl Backend for Engine {
 
     fn set_routes(&mut self, routes: HashMap<String, RouteTarget>) -> Result<(), EngineError> {
         Engine::set_routes(self, routes)
+    }
+
+    fn set_default_sink(&mut self, name: Option<String>) -> Result<(), EngineError> {
+        Engine::set_default_sink(self, name)
     }
 }
 
@@ -76,6 +84,10 @@ pub enum Command {
     },
     /// Grava e fecha o gesto agora (concluir gesto, trocar de perfil).
     Flush,
+    /// “Desligar mixer / voltar ao áudio normal”: restaura a saída padrão anterior (se ainda for a do Iara) e encerra.
+    Deactivate {
+        reply: Option<Reply<Result<(), String>>>,
+    },
     Shutdown,
 }
 
@@ -117,6 +129,8 @@ pub struct Status {
     pub reconnect_attempts: u32,
     /// Último relatório de aplicativos do motor (fluxos agrupados por aplicativo).
     pub apps: Vec<AppReport>,
+    /// Situação da saída principal do Iara como saída padrão do sistema.
+    pub default_output: DefaultOutput,
 }
 
 pub struct Service<B: Backend> {
@@ -133,6 +147,11 @@ pub struct Service<B: Backend> {
     notifier: Option<Box<dyn Fn(u64)>>,
     overrides: Overrides,
     last_routes: Option<HashMap<String, RouteTarget>>,
+    policy: Policy,
+    /// Saída padrão configurada, como a última observação do motor (`None` = sem escolha configurada).
+    observed_default: Option<String>,
+    /// Já recebi a observação desta conexão? Sem ela, não se decide nada sobre a saída padrão.
+    default_seen: bool,
 }
 
 /// Perfil ativo da configuração; sem nenhum, usa o primeiro existente ou cria o padrão. Nunca sobrescreve um perfil
@@ -170,6 +189,10 @@ fn load_or_create_profile(store: &Store) -> Result<Profile, ServiceError> {
 impl<B: Backend> Service<B> {
     pub fn new(store: Store, connect: Connector<B>, sink: EventSink) -> Result<Self, ServiceError> {
         let profile = load_or_create_profile(&store)?;
+        let capture_default = store
+            .load_config()
+            .map_or(true, |(c, _)| c.capture_default_output);
+        let stored_default = store.load_default_sink_state().ok().flatten();
         Ok(Self {
             store,
             profile,
@@ -178,12 +201,22 @@ impl<B: Backend> Service<B> {
             connect,
             sink,
             retry: None,
-            status: Status::default(),
+            status: Status {
+                default_output: if capture_default {
+                    DefaultOutput::Waiting
+                } else {
+                    DefaultOutput::Disabled
+                },
+                ..Status::default()
+            },
             stopped: false,
             serial: 1,
             notifier: None,
             overrides: Overrides::new(),
             last_routes: None,
+            policy: Policy::new(capture_default, stored_default),
+            observed_default: None,
+            default_seen: false,
         })
     }
 
@@ -197,8 +230,89 @@ impl<B: Backend> Service<B> {
             serial: self.serial,
             profile: self.profile.clone(),
             status: self.status.clone(),
-            apps: apps::views(&self.profile, &self.overrides, &self.status.apps),
+            apps: apps::views(
+                &self.profile,
+                &self.overrides,
+                &self.status.apps,
+                self.status.default_output == DefaultOutput::Active,
+            ),
         }
+    }
+
+    /// Há uma saída física preferida, presente e já ligada (instalar a saída padrão sem isso deixaria o sistema mudo).
+    fn output_ready(&self) -> bool {
+        let (Some(pref), Some(report)) = (&self.profile.preferred_output, &self.status.last_report)
+        else {
+            return false;
+        };
+        // a lista de ausentes é uma só (o relatório do último apply, ajustado pelos eventos que vieram depois)
+        self.status.connected
+            && report.is_complete()
+            && !self.status.absent_devices.contains(&pref.persistent_key)
+    }
+
+    fn execute_default(&mut self, effects: Vec<Effect>, now: Instant) {
+        for fx in effects {
+            match fx {
+                Effect::Set(name) => {
+                    if let Some(b) = self.backend.as_mut() {
+                        if let Err(EngineError::Disconnected) = b.set_default_sink(name) {
+                            self.drop_backend(now);
+                        }
+                    }
+                }
+                Effect::Persist(st) => {
+                    if let Err(e) = self.store.save_default_sink_state(&st) {
+                        eprintln!("iara: não foi possível registrar a saída padrão anterior: {e}");
+                    }
+                }
+                Effect::Clear => {
+                    if let Err(e) = self.store.clear_default_sink_state() {
+                        eprintln!("iara: falha ao limpar o registro da saída padrão: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Decide sobre a saída padrão do sistema com a última observação. Na primeira execução, sem saída preferida, adota
+    /// o padrão atual do sistema como preferida (assim o áudio continua saindo pelo mesmo dispositivo, agora pelo mixer).
+    fn evaluate_default(&mut self, now: Instant) {
+        if !self.default_seen || !self.policy_enabled() {
+            return;
+        }
+        if self.profile.preferred_output.is_none() {
+            if let Some(cur) = self.observed_default.clone().filter(|c| c != INSTALLED) {
+                let cmd = EditCommand::SetPreferredOutput(Some(cur));
+                if let Ok((next, _)) = edit::apply(&self.profile, &cmd) {
+                    self.replace_profile(
+                        next,
+                        EditKind::Structural(RevisionReason::Structural),
+                        now,
+                    );
+                    return;
+                }
+            }
+        }
+        let effects = self
+            .policy
+            .evaluate(self.observed_default.as_deref(), self.output_ready());
+        self.execute_default(effects, now);
+        let status = self.policy.status();
+        if status != self.status.default_output {
+            self.status.default_output = status;
+            self.changed();
+        }
+    }
+
+    fn policy_enabled(&self) -> bool {
+        self.policy.status() != DefaultOutput::Disabled
+    }
+
+    /// Restaura a saída padrão anterior (se ainda for a do Iara) antes de largar o motor.
+    fn release_default(&mut self, now: Instant) {
+        let effects = self.policy.deactivate(self.observed_default.as_deref());
+        self.execute_default(effects, now);
     }
 
     /// Manda o plano de rotas ao motor quando ele mudou (ou sempre, com `force`, ao reconectar).
@@ -250,6 +364,8 @@ impl<B: Backend> Service<B> {
                 self.retry = None;
                 self.status.connected = true;
                 self.status.reconnect_attempts = 0;
+                self.policy.reconnected();
+                self.default_seen = false;
                 self.apply_current(now);
                 self.sync_routes(true, now);
                 self.changed();
@@ -275,6 +391,7 @@ impl<B: Backend> Service<B> {
         self.status.absent_devices.clear();
         self.status.apps.clear();
         self.last_routes = None;
+        self.default_seen = false;
         if self.retry.is_none() {
             self.retry = Some((now + BACKOFF[0], 0));
             self.status.reconnect_attempts = 1;
@@ -294,7 +411,10 @@ impl<B: Backend> Service<B> {
                 if !report.is_complete() {
                     eprintln!("iara: aplicação parcial, ausentes: {:?}", report.missing);
                 }
-                if self.status.last_report.as_ref() != Some(&report) {
+                // o apply é a leitura mais fresca de quais dispositivos preferidos estão ausentes
+                let absent_changed = self.status.absent_devices != report.absent_devices;
+                self.status.absent_devices = report.absent_devices.clone();
+                if absent_changed || self.status.last_report.as_ref() != Some(&report) {
                     self.status.last_report = Some(report);
                     self.changed();
                 }
@@ -302,6 +422,7 @@ impl<B: Backend> Service<B> {
             Err(EngineError::Disconnected) => self.drop_backend(now),
             Err(e) => eprintln!("iara: falha ao aplicar o perfil: {e}"),
         }
+        self.evaluate_default(now);
     }
 
     fn execute(&mut self, actions: Vec<Action>) {
@@ -401,9 +522,21 @@ impl<B: Backend> Service<B> {
                 let actions = self.tracker.flush();
                 self.execute(actions);
             }
+            Msg::Command(Command::Deactivate { reply }) => {
+                let actions = self.tracker.flush();
+                self.execute(actions);
+                self.release_default(now);
+                self.backend = None;
+                self.status.connected = false;
+                self.stopped = true;
+                if let Some(r) = reply {
+                    let _ = r.send(Ok(()));
+                }
+            }
             Msg::Command(Command::Shutdown) => {
                 let actions = self.tracker.flush();
                 self.execute(actions);
+                self.release_default(now);
                 self.backend = None;
                 self.status.connected = false;
                 self.stopped = true;
@@ -414,6 +547,12 @@ impl<B: Backend> Service<B> {
                     self.status.absent_devices.push(d);
                     self.changed();
                 }
+                self.evaluate_default(now);
+            }
+            Msg::Engine(Event::DefaultSink { configured, .. }) => {
+                self.observed_default = configured;
+                self.default_seen = true;
+                self.evaluate_default(now);
             }
             Msg::Engine(Event::Apps(reports)) => {
                 if self.status.apps != reports {
@@ -428,6 +567,7 @@ impl<B: Backend> Service<B> {
             Msg::Engine(Event::DeviceBack(d)) => {
                 self.status.absent_devices.retain(|x| *x != d);
                 self.changed();
+                self.evaluate_default(now);
             }
         }
     }
@@ -480,6 +620,8 @@ mod tests {
     struct World {
         applied: RefCell<Vec<Plan>>,
         routes: RefCell<Vec<HashMap<String, RouteTarget>>>,
+        default_sets: RefCell<Vec<Option<String>>>,
+        absent: RefCell<Vec<String>>,
         connects: Cell<u32>,
         fail_connects: Cell<u32>,
         fail_apply_disconnected: Cell<bool>,
@@ -496,7 +638,7 @@ mod tests {
             Ok(ApplyReport {
                 observed: 1,
                 missing: vec![],
-                absent_devices: vec![],
+                absent_devices: self.0.absent.borrow().clone(),
             })
         }
 
@@ -505,6 +647,11 @@ mod tests {
                 return Err(EngineError::Disconnected);
             }
             self.0.routes.borrow_mut().push(routes);
+            Ok(())
+        }
+
+        fn set_default_sink(&mut self, name: Option<String>) -> Result<(), EngineError> {
+            self.0.default_sets.borrow_mut().push(name);
             Ok(())
         }
     }
@@ -1027,5 +1174,168 @@ mod tests {
             world.routes.borrow().len() > before,
             "após reconectar, o plano é reenviado"
         );
+    }
+
+    const FONE: &str = "alsa_output.pci-0000_0b_00.4.analog-stereo";
+
+    fn observed(configured: Option<&str>) -> Msg {
+        Msg::Engine(Event::DefaultSink {
+            configured: configured.map(Into::into),
+            effective: configured.map(Into::into),
+        })
+    }
+
+    fn sets(world: &World) -> Vec<Option<String>> {
+        world.default_sets.borrow().clone()
+    }
+
+    #[test]
+    fn first_run_adopts_the_current_default_as_the_output_then_installs_the_iara_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        assert!(
+            sets(&world).is_empty(),
+            "sem observação do sistema, nada é decidido"
+        );
+        svc.handle(observed(Some(FONE)), t0);
+        // sem saída preferida, o padrão atual vira a saída preferida (o áudio continua saindo pelo mesmo dispositivo)
+        assert_eq!(
+            svc.profile()
+                .preferred_output
+                .as_ref()
+                .map(|d| d.persistent_key.as_str()),
+            Some(FONE)
+        );
+        // o fake backend reporta o plano completo e sem dispositivos ausentes: saída pronta → instala
+        assert_eq!(sets(&world), vec![Some("iara.unassigned".to_owned())]);
+        assert_eq!(svc.status().default_output, DefaultOutput::Active);
+        // o anterior foi gravado ANTES de trocar
+        let store = Store::open(dir.path().join("config"), dir.path().join("state"));
+        assert_eq!(
+            store
+                .load_default_sink_state()
+                .unwrap()
+                .unwrap()
+                .previous
+                .as_deref(),
+            Some(FONE)
+        );
+        // o sistema confirma; nada mais a fazer
+        svc.handle(observed(Some("iara.unassigned")), t0);
+        assert_eq!(sets(&world).len(), 1);
+    }
+
+    #[test]
+    fn it_never_installs_without_a_physical_output_that_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        // perfil com saída preferida, mas o dispositivo está ausente: instalar deixaria o sistema mudo
+        let mut p = svc.profile().clone();
+        p.preferred_output = Some(iara_core::DevicePreference {
+            persistent_key: "alsa_output.ausente".into(),
+        });
+        svc.handle(
+            set(&p, EditKind::Structural(RevisionReason::Structural)),
+            Instant::now(),
+        );
+        let t0 = Instant::now();
+        svc.start(t0);
+        world.absent.borrow_mut().push("alsa_output.ausente".into());
+        svc.handle(
+            Msg::Engine(Event::DeviceAbsent("alsa_output.ausente".into())),
+            t0,
+        );
+        svc.handle(observed(Some(FONE)), t0);
+        assert!(sets(&world).is_empty());
+        assert_eq!(svc.status().default_output, DefaultOutput::Waiting);
+        // o dispositivo volta: agora sim há saída física pronta e a instalação acontece
+        world.absent.borrow_mut().clear();
+        svc.handle(
+            Msg::Engine(Event::DeviceBack("alsa_output.ausente".into())),
+            t0,
+        );
+        assert_eq!(sets(&world), vec![Some("iara.unassigned".to_owned())]);
+        assert_eq!(svc.status().default_output, DefaultOutput::Active);
+    }
+
+    #[test]
+    fn a_later_user_choice_is_respected_and_deactivating_restores_only_what_is_still_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        svc.handle(observed(Some(FONE)), t0);
+        svc.handle(observed(Some("iara.unassigned")), t0);
+        // o usuário escolhe outra saída: posse largada, registro apagado, nada é reinstalado
+        svc.handle(observed(Some("alsa_output.usb-caixas")), t0);
+        assert_eq!(svc.status().default_output, DefaultOutput::Released);
+        let store = Store::open(dir.path().join("config"), dir.path().join("state"));
+        assert_eq!(store.load_default_sink_state().unwrap(), None);
+        let before = sets(&world).len();
+        svc.handle(Msg::Command(Command::Deactivate { reply: None }), t0);
+        assert!(svc.is_stopped());
+        assert_eq!(
+            sets(&world).len(),
+            before,
+            "desligar não restaura por cima da escolha do usuário"
+        );
+    }
+
+    #[test]
+    fn deactivating_restores_the_previous_default_and_clears_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        svc.handle(observed(Some(FONE)), t0);
+        svc.handle(observed(Some("iara.unassigned")), t0);
+        let (tx, rx) = mpsc::channel();
+        svc.handle(Msg::Command(Command::Deactivate { reply: Some(tx) }), t0);
+        assert!(rx.try_recv().unwrap().is_ok());
+        assert_eq!(sets(&world).last().cloned(), Some(Some(FONE.to_owned())));
+        let store = Store::open(dir.path().join("config"), dir.path().join("state"));
+        assert_eq!(store.load_default_sink_state().unwrap(), None);
+        assert!(svc.is_stopped());
+    }
+
+    #[test]
+    fn a_graceful_stop_also_restores_and_a_restart_after_a_crash_keeps_the_original_previous() {
+        // queda: o serviço morre com o Iara como padrão e o registro em disco
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (mut svc, _w) = service(&dir);
+            let t0 = Instant::now();
+            svc.start(t0);
+            svc.handle(observed(Some(FONE)), t0);
+            svc.handle(observed(Some("iara.unassigned")), t0);
+        } // sem Deactivate nem Shutdown
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        svc.handle(observed(Some("iara.unassigned")), t0);
+        assert!(sets(&world).is_empty(), "já é o Iara: não reinstala");
+        assert_eq!(svc.status().default_output, DefaultOutput::Active);
+        // parada normal (SIGTERM): restaura o anterior que estava em disco, não o próprio Iara
+        svc.handle(Msg::Command(Command::Shutdown), t0);
+        assert_eq!(sets(&world).last().cloned(), Some(Some(FONE.to_owned())));
+    }
+
+    #[test]
+    fn disabling_the_capture_in_the_config_leaves_the_system_default_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("config"), dir.path().join("state"));
+        let mut cfg = store.load_config().unwrap().0;
+        cfg.capture_default_output = false;
+        store.save_config(&cfg).unwrap();
+        let (mut svc, world) = service(&dir);
+        let t0 = Instant::now();
+        svc.start(t0);
+        svc.handle(observed(Some(FONE)), t0);
+        assert!(sets(&world).is_empty() && svc.profile().preferred_output.is_none());
+        assert_eq!(svc.status().default_output, DefaultOutput::Disabled);
+        svc.handle(Msg::Command(Command::Shutdown), t0);
+        assert!(sets(&world).is_empty());
     }
 }

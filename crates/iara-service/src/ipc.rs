@@ -43,6 +43,7 @@ fn entry(a: AppView) -> AppEntry {
 pub fn to_state(s: Snapshot) -> State {
     State {
         apps: s.apps.into_iter().map(entry).collect(),
+        default_output: s.status.default_output,
         serial: s.serial,
         profile: s.profile,
         connected: s.status.connected,
@@ -71,6 +72,15 @@ impl Controller for ServiceController {
                 choice,
                 reply: Some(reply),
             }))
+            .map_err(|_| "serviço encerrando".to_owned())?;
+        rx.recv_timeout(REPLY_TIMEOUT)
+            .map_err(|_| "o serviço não respondeu a tempo".to_owned())?
+    }
+
+    fn deactivate(&self) -> Result<(), String> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Msg::Command(Command::Deactivate { reply: Some(reply) }))
             .map_err(|_| "serviço encerrando".to_owned())?;
         rx.recv_timeout(REPLY_TIMEOUT)
             .map_err(|_| "o serviço não respondeu a tempo".to_owned())?

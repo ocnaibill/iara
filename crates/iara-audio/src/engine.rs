@@ -53,6 +53,11 @@ pub enum Event {
     DeviceBack(String),
     /// Estado dos aplicativos (fluxos de reprodução agrupados por aplicativo) quando algo muda.
     Apps(Vec<AppReport>),
+    /// Saída padrão do sistema mudou: a configurada (a que o usuário ou o Iara escolheram) e a efetiva (a que vale agora).
+    DefaultSink {
+        configured: Option<String>,
+        effective: Option<String>,
+    },
 }
 
 /// Resultado de uma aplicação. `missing` lista os nós esperados que não apareceram no registro dentro do prazo;
@@ -75,6 +80,8 @@ type Reply = mpsc::Sender<Result<ApplyReport, EngineError>>;
 
 enum Command {
     SetRoutes(HashMap<String, RouteTarget>),
+    /// Define (ou, com `None`, remove) a saída padrão configurada do sistema.
+    SetDefaultSink(Option<String>),
     Apply(Box<Plan>, Reply),
     Shutdown,
 }
@@ -139,6 +146,14 @@ impl Engine {
     pub fn set_routes(&self, routes: HashMap<String, RouteTarget>) -> Result<(), EngineError> {
         self.tx
             .send(Command::SetRoutes(routes))
+            .map_err(|_| EngineError::Disconnected)
+    }
+
+    /// Define a saída padrão configurada do sistema (`None` apaga a escolha e devolve a decisão ao gerenciador de sessão).
+    /// Assíncrono: a mudança chega depois como `Event::DefaultSink`.
+    pub fn set_default_sink(&self, name: Option<String>) -> Result<(), EngineError> {
+        self.tx
+            .send(Command::SetDefaultSink(name))
             .map_err(|_| EngineError::Disconnected)
     }
 
@@ -246,6 +261,9 @@ struct State {
     links: HashMap<u32, (u32, u32)>,
     /// Metadata `default` (onde se define o destino de cada fluxo) e seu id global.
     metadata: Option<(u32, pw::metadata::Metadata)>,
+    metadata_listener: Option<pw::metadata::MetadataListener>,
+    /// Saída padrão: (configurada, efetiva), como vistas no metadata.
+    defaults: (Option<String>, Option<String>),
     /// Proxies dos fluxos de aplicativos, com o listener de `info`: as propriedades completas (ex.: `node.dont-move`)
     /// só chegam depois do anúncio no registro.
     stream_nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
@@ -524,11 +542,21 @@ fn run(
     let state: Rc<RefCell<State>> = Rc::default();
     let disconnected = Rc::new(std::cell::Cell::new(false));
 
+    // Encerramento com descarga: antes de sair, uma ida-e-volta com o daemon garante que as últimas mensagens (ex.: a saída
+    // padrão restaurada) foram entregues; sem isso o processo pode terminar com elas ainda no buffer da conexão.
+    let shutdown_seq: Rc<Cell<Option<pw::spa::utils::result::AsyncSeq>>> = Rc::default();
+    let shutdown_deadline: Rc<Cell<Option<Instant>>> = Rc::default();
     let _core_listener = {
         let ml = mainloop.clone();
         let dc = disconnected.clone();
         let ev = ev_tx.clone();
+        let (ml_done, sd) = (mainloop.clone(), shutdown_seq.clone());
         core.add_listener_local()
+            .done(move |id, seq| {
+                if id == pw::core::PW_ID_CORE && sd.get() == Some(seq) {
+                    ml_done.quit();
+                }
+            })
             .error(move |id, _seq, res, _msg| {
                 // -EPIPE no objeto core: o daemon fechou a conexão (reinício ou queda do PipeWire).
                 if id == pw::core::PW_ID_CORE && res == -32 {
@@ -544,6 +572,7 @@ fn run(
         let st_add = state.clone();
         let st_rm = state.clone();
         let reg = registry.clone();
+        let ev_reg = ev_tx.clone();
         registry
             .add_listener_local()
             .global(move |g| {
@@ -565,7 +594,42 @@ fn run(
                     ObjectType::Metadata => {
                         if props.and_then(|p| p.get("metadata.name")) == Some("default") {
                             if let Ok(m) = reg.bind::<pw::metadata::Metadata, _>(g) {
-                                st_add.borrow_mut().metadata = Some((g.id, m));
+                                let (st_m, ev_m) = (st_add.clone(), ev_reg.clone());
+                                let listener = m
+                                    .add_listener_local()
+                                    .property(move |subject, key, _type, value| {
+                                        if subject != 0 {
+                                            return 0;
+                                        }
+                                        let configured = match key {
+                                            Some("default.configured.audio.sink") => true,
+                                            Some("default.audio.sink") => false,
+                                            _ => return 0,
+                                        };
+                                        let parsed = value.and_then(crate::defaults::parse_name);
+                                        let snapshot = {
+                                            let mut st = st_m.borrow_mut();
+                                            let slot = if configured {
+                                                &mut st.defaults.0
+                                            } else {
+                                                &mut st.defaults.1
+                                            };
+                                            if *slot == parsed {
+                                                return 0;
+                                            }
+                                            *slot = parsed;
+                                            st.defaults.clone()
+                                        };
+                                        ev_m(Event::DefaultSink {
+                                            configured: snapshot.0,
+                                            effective: snapshot.1,
+                                        });
+                                        0
+                                    })
+                                    .register();
+                                let mut st = st_add.borrow_mut();
+                                st.metadata = Some((g.id, m));
+                                st.metadata_listener = Some(listener);
                             }
                         }
                         return;
@@ -682,7 +746,13 @@ fn run(
         let st = state.clone();
         let ctx = context.clone();
         let ev = ev_tx.clone();
+        let (ml_t, deadline) = (mainloop.clone(), shutdown_deadline.clone());
         mainloop.loop_().add_timer(move |_| {
+            // prazo-limite do encerramento (o daemon pode não responder)
+            if deadline.get().is_some_and(|d| Instant::now() >= d) {
+                ml_t.quit();
+                return;
+            }
             reconcile_devices(&mut st.borrow_mut(), &ctx, &ev);
             reconcile_routes(&mut st.borrow_mut(), &ev);
             check_pending(&st, false);
@@ -697,7 +767,26 @@ fn run(
         let ctx = context.clone();
         let ev = ev_tx.clone();
         rx.attach(mainloop.loop_(), move |cmd| match cmd {
-            Command::Shutdown => ml.quit(),
+            Command::Shutdown => match core.sync(0) {
+                Ok(seq) => {
+                    shutdown_seq.set(Some(seq));
+                    shutdown_deadline.set(Some(Instant::now() + Duration::from_secs(1)));
+                }
+                Err(_) => ml.quit(),
+            },
+            Command::SetDefaultSink(name) => {
+                if let Some((_, meta)) = st.borrow().metadata.as_ref() {
+                    match name {
+                        Some(n) => meta.set_property(
+                            0,
+                            "default.configured.audio.sink",
+                            Some("Spa:String:JSON"),
+                            Some(&crate::defaults::name_json(&n)),
+                        ),
+                        None => meta.set_property(0, "default.configured.audio.sink", None, None),
+                    }
+                }
+            }
             Command::SetRoutes(routes) => {
                 let mut s = st.borrow_mut();
                 s.routes = routes;

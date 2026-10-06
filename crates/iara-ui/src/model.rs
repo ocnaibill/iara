@@ -3,7 +3,7 @@
 
 use iara_core::edit::EditCommand;
 use iara_core::{chatmix, Gain, Profile, SendControl};
-use iara_ipc::{AppEntry, AppSource, AppState, SessionChoice, State};
+use iara_ipc::{AppEntry, AppSource, AppState, DefaultOutput, SessionChoice, State};
 
 /// Menor posição positiva do slider: p = 0 é silêncio exato; qualquer p > 0 é um ganho de −60 a 0 dB (spec 5).
 pub const MIN_POSITION: f64 = 1e-6;
@@ -204,7 +204,7 @@ pub fn coalesce(commands: Vec<EditCommand>) -> Vec<EditCommand> {
 pub fn coalesce_ui(commands: Vec<UiCommand>) -> Vec<UiCommand> {
     coalesce_by(commands, |c| match c {
         UiCommand::Edit(e) => coalesce_key(e),
-        UiCommand::Session { .. } => None,
+        UiCommand::Session { .. } | UiCommand::Deactivate => None,
     })
 }
 
@@ -259,6 +259,23 @@ pub fn status_lines(state: &State) -> Vec<StatusLine> {
             text: format!("Alterações não gravadas no disco: {e}"),
         });
     }
+    match state.default_output {
+        DefaultOutput::Released => lines.push(StatusLine {
+            kind: StatusKind::Warning,
+            text: "A saída padrão do sistema foi trocada: aplicativos novos não passam pelo mixer. \
+                   Escolha “Iara — Saída principal” como saída para voltar."
+                .to_owned(),
+        }),
+        DefaultOutput::Waiting if state.connected => lines.push(StatusLine {
+            kind: StatusKind::Info,
+            text: "O Iara ainda não é a saída padrão do sistema: falta uma saída física preferida presente.".to_owned(),
+        }),
+        DefaultOutput::Disabled => lines.push(StatusLine {
+            kind: StatusKind::Info,
+            text: "A captura da saída padrão está desligada na configuração.".to_owned(),
+        }),
+        _ => {}
+    }
     for d in &state.absent_devices {
         lines.push(StatusLine {
             kind: StatusKind::Warning,
@@ -272,7 +289,12 @@ pub fn status_lines(state: &State) -> Vec<StatusLine> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiCommand {
     Edit(EditCommand),
-    Session { key: String, choice: SessionChoice },
+    /// “Desligar mixer / voltar ao áudio normal”: restaura a saída padrão anterior e encerra o serviço.
+    Deactivate,
+    Session {
+        key: String,
+        choice: SessionChoice,
+    },
 }
 
 /// Mover um aplicativo para `channel` (`None` = Não atribuídos). Salva uma regra no perfil, ou, com `session_only`,
@@ -324,6 +346,9 @@ pub fn state_text(state: AppState) -> &'static str {
         AppState::DontMove => "o aplicativo não aceita ser movido",
         AppState::Waiting => "aguardando áudio",
         AppState::Unmanaged => "sem identificação suficiente",
+        AppState::Outside => {
+            "usa uma saída própria, fora do mixer; associe a um canal para trazê-lo"
+        }
     }
 }
 
@@ -333,6 +358,7 @@ fn glyph(state: AppState) -> &'static str {
         AppState::Applying => "…",
         AppState::Partial => "◐",
         AppState::NotApplied | AppState::DontMove | AppState::Unmanaged => "⚠",
+        AppState::Outside => "↗",
         AppState::Elsewhere => "↪",
     }
 }
@@ -437,6 +463,7 @@ mod tests {
             absent_devices: vec![],
             reconnect_attempts: 0,
             apps: vec![],
+            default_output: DefaultOutput::Active,
         }
     }
 
@@ -815,5 +842,41 @@ mod tests {
             gain(-3.0),
         ]);
         assert_eq!(out, vec![session("game"), session("chat"), gain(-3.0)]);
+    }
+
+    #[test]
+    fn the_default_output_situation_is_explained_in_text_and_active_is_quiet() {
+        let mut s = state(initial_profile());
+        assert!(status_lines(&s).is_empty(), "ativa: nada a dizer");
+        s.default_output = DefaultOutput::Released;
+        let l = status_lines(&s);
+        assert_eq!((l.len(), l[0].kind), (1, StatusKind::Warning));
+        assert!(l[0].text.contains("não passam pelo mixer"));
+        s.default_output = DefaultOutput::Waiting;
+        assert!(status_lines(&s)[0].text.contains("falta uma saída física"));
+        s.connected = false; // sem conexão, só o aviso de conexão (não empilhar avisos que dependem dela)
+        assert!(!status_lines(&s)
+            .iter()
+            .any(|l| l.text.contains("falta uma saída")));
+        s.connected = true;
+        s.default_output = DefaultOutput::Disabled;
+        assert!(status_lines(&s)[0].text.contains("desligada"));
+    }
+
+    #[test]
+    fn an_app_outside_the_mixer_says_so_and_how_to_fix_it() {
+        let app = entry(
+            "Jogo",
+            Some("bin:jogo"),
+            Some("jogo"),
+            None,
+            AppSource::Default,
+            AppState::Outside,
+        );
+        let chip = chip(&app);
+        assert_eq!(chip.glyph, "↗");
+        assert!(
+            chip.tooltip.contains("fora do mixer") && chip.tooltip.contains("associe a um canal")
+        );
     }
 }

@@ -65,18 +65,41 @@ fn state_of(app: &AppReport) -> AppState {
 }
 
 /// Aplicativos para a interface: os que estão tocando (com estado real) e os que têm regra salva mas estão em silêncio.
-pub fn views(profile: &Profile, overrides: &Overrides, reports: &[AppReport]) -> Vec<AppView> {
+/// `capture_active`: o Iara é a saída padrão do sistema (aplicativos sem regra deveriam entrar pelo mixer).
+pub fn views(
+    profile: &Profile,
+    overrides: &Overrides,
+    reports: &[AppReport],
+    capture_active: bool,
+) -> Vec<AppView> {
     let mut out: Vec<AppView> = reports
         .iter()
         .map(|r| {
             let (channel, source) = destination_of(profile, overrides, &r.identity);
+            let mut state = state_of(r);
+            // sem regra, com o Iara como saída padrão, e ainda assim fora do mixer: o aplicativo usa uma saída própria
+            if capture_active
+                && channel.is_none()
+                && source == Source::Default
+                && !r.streams.is_empty()
+            {
+                let at_iara = |s: &iara_audio::StreamReport| {
+                    s.linked_to.iter().any(|n| n.starts_with("iara."))
+                };
+                if r.streams
+                    .iter()
+                    .all(|s| !at_iara(s) && !s.linked_to.is_empty())
+                {
+                    state = AppState::Outside;
+                }
+            }
             AppView {
                 key: r.identity.key(),
                 display: r.identity.display_name(),
                 identity: r.identity.clone(),
                 channel,
                 source,
-                state: state_of(r),
+                state,
                 streams: r.streams.len(),
             }
         })
@@ -222,7 +245,7 @@ mod tests {
             AppRouteState::Applied,
             &[(StreamState::Applied, &["iara.ch.media"])],
         )];
-        let v = views(&p2, &Overrides::new(), &reports);
+        let v = views(&p2, &Overrides::new(), &reports, false);
         assert_eq!(v.len(), 2);
         let zen = v
             .iter()
@@ -241,14 +264,14 @@ mod tests {
             (Some("chat"), AppState::Waiting, 0)
         );
         // regra de app que está tocando não duplica a linha
-        assert_eq!(views(&p, &Overrides::new(), &reports).len(), 1);
+        assert_eq!(views(&p, &Overrides::new(), &reports, false).len(), 1);
     }
 
     #[test]
     fn not_applied_is_refined_into_dont_move_elsewhere_or_plain_refusal() {
         let p = initial_profile();
         let no = StreamState::NotApplied;
-        let s = |r: AppReport| views(&p, &Overrides::new(), &[r])[0].state;
+        let s = |r: AppReport| views(&p, &Overrides::new(), &[r], false)[0].state;
         assert_eq!(
             s(report(
                 "a",
@@ -281,6 +304,56 @@ mod tests {
                 &[(StreamState::Applied, &["x"]), (no, &["y"])]
             )),
             AppState::Partial
+        );
+    }
+
+    #[test]
+    fn an_app_without_a_rule_that_keeps_its_own_output_is_outside_the_mixer_only_when_the_iara_is_the_default(
+    ) {
+        let p = initial_profile();
+        let own = report(
+            "jogo",
+            AppRouteState::Applied,
+            &[(StreamState::Applied, &["alsa_output.fone"])],
+        );
+        let through = report(
+            "zen",
+            AppRouteState::Applied,
+            &[(StreamState::Applied, &["iara.unassigned"])],
+        );
+        let off = views(
+            &p,
+            &Overrides::new(),
+            &[own.clone(), through.clone()],
+            false,
+        );
+        assert!(
+            off.iter().all(|a| a.state != AppState::Outside),
+            "sem a saída padrão do Iara, não há expectativa"
+        );
+        let on = views(&p, &Overrides::new(), &[own, through], true);
+        let state = |bin: &str| {
+            on.iter()
+                .find(|a| a.key.as_deref() == Some(&format!("bin:{bin}")))
+                .unwrap()
+                .state
+        };
+        assert_eq!(state("jogo"), AppState::Outside);
+        assert_eq!(
+            state("zen"),
+            AppState::Applied,
+            "o que passa pelo Iara não é aviso"
+        );
+        // com regra, a situação é outra (aplicado ou não), não "fora do mixer"
+        let ruled = profile_with_rule("jogo", "game");
+        let own = report(
+            "jogo",
+            AppRouteState::NotApplied,
+            &[(StreamState::NotApplied, &["alsa_output.fone"])],
+        );
+        assert_eq!(
+            views(&ruled, &Overrides::new(), &[own], true)[0].state,
+            AppState::NotApplied
         );
     }
 

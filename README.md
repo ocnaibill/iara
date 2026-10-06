@@ -44,4 +44,6 @@ cargo run -p iara-ui --features gtk-ui -- --demo          # dados de exemplo, se
 cargo run -p iara-ui --features gtk-ui -- --demo --screenshot captura.png   # grava a janela em PNG e sai
 ```
 
+`iara-service --restore-default` devolve a saída padrão anterior se um serviço anterior caiu deixando o Iara como padrão do sistema.
+
 `tools/provas/13-ui-ao-vivo.sh` abre a janela contra um serviço de teste, muda valores por fora (`busctl`) e captura o resultado.

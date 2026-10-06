@@ -10,7 +10,7 @@ use gtk::prelude::*;
 use gtk::{gdk, glib};
 use iara_core::edit::{EditCommand, MicSend, SendKind};
 use iara_core::Gain;
-use iara_ipc::{AppEntry, AppSource, AppState, State};
+use iara_ipc::{AppEntry, AppSource, AppState, DefaultOutput, State};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -929,6 +929,7 @@ pub fn demo_state() -> State {
         persist_error: None,
         absent_devices: vec!["alsa_output.usb-fone-exemplo".into()],
         reconnect_attempts: 0,
+        default_output: DefaultOutput::Active,
         apps: vec![
             app(
                 "Zen",
@@ -978,6 +979,13 @@ pub fn demo_state() -> State {
                 None,
                 AppSource::Default,
                 AppState::Applied,
+            ),
+            app(
+                "Navegador",
+                "navegador",
+                None,
+                AppSource::Default,
+                AppState::Outside,
             ),
         ],
     }
@@ -1054,6 +1062,40 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
         session_toggle.connect_toggled(move |b| only.set(b.is_active()));
     }
     header.pack_end(&session_toggle);
+    // “Desligar mixer / voltar ao áudio normal” (spec 14): restaura a saída padrão anterior e encerra o serviço; confirma antes
+    let off_pop = gtk::Popover::new();
+    let off_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    for set in [
+        gtk::Widget::set_margin_top,
+        gtk::Widget::set_margin_bottom,
+        gtk::Widget::set_margin_start,
+        gtk::Widget::set_margin_end,
+    ] {
+        set(off_box.upcast_ref(), 10);
+    }
+    let off_text = label(
+        "O áudio volta ao normal: a saída padrão anterior é restaurada\ne o serviço do Iara é encerrado.",
+        "strip-caption",
+    );
+    off_text.set_xalign(0.0);
+    let off_ok = gtk::Button::with_label("Desligar mixer");
+    off_ok.add_css_class("destructive-action");
+    off_box.append(&off_text);
+    off_box.append(&off_ok);
+    off_pop.set_child(Some(&off_box));
+    {
+        let (e, p) = (ctx.emit.clone(), off_pop.clone());
+        off_ok.connect_clicked(move |_| {
+            e(UiCommand::Deactivate);
+            p.popdown();
+        });
+    }
+    let off_button = gtk::MenuButton::builder()
+        .label("Desligar mixer")
+        .popover(&off_pop)
+        .tooltip_text("Voltar ao áudio normal e encerrar o serviço")
+        .build();
+    header.pack_end(&off_button);
     window.set_titlebar(Some(&header));
 
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 10);

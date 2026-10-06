@@ -5,6 +5,7 @@
 //! do ramo; todo objeto declara o opt-out da restauração de estado do WirePlumber. Esta conexão é uma sessão: se o
 //! PipeWire cair, o motor emite `Event::Disconnected` e encerra; quem reconstrói é o serviço (spec 8.8).
 
+mod defaults;
 mod engine;
 pub mod routing;
 

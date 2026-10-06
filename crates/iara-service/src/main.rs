@@ -5,7 +5,75 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use std::process::ExitCode;
 use std::sync::{mpsc, Arc};
 
+/// Recuperação: se um serviço anterior caiu deixando o Iara como saída padrão do sistema, devolve o padrão anterior
+/// (só se o padrão atual ainda for o do Iara) sem subir o mixer. Seguro de rodar a qualquer momento.
+fn restore_default() -> ExitCode {
+    use iara_audio::Event;
+    use iara_service::default_sink::INSTALLED;
+    let store = match iara_store::Store::from_xdg() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Iara: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let state = match store.load_default_sink_state() {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            eprintln!("Iara: não há saída padrão anterior registrada; nada a restaurar.");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("Iara: registro da saída padrão ilegível: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (tx, rx) = mpsc::channel();
+    let sink: EventSink = Arc::new(move |e| {
+        if let Event::DefaultSink { configured, .. } = e {
+            let _ = tx.send(configured);
+        }
+    });
+    let engine = match Engine::start_with(sink) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Iara: sem acesso ao PipeWire: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let current = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .ok()
+        .flatten();
+    if current.as_deref() != Some(INSTALLED) {
+        eprintln!(
+            "Iara: a saída padrão atual ({}) não é a do Iara; nada alterado.",
+            current.as_deref().unwrap_or("nenhuma")
+        );
+    } else {
+        let previous = state.previous.filter(|p| p != INSTALLED);
+        eprintln!(
+            "Iara: restaurando a saída padrão para {}",
+            previous.as_deref().unwrap_or("(escolha automática)")
+        );
+        if engine.set_default_sink(previous).is_err() {
+            return ExitCode::FAILURE;
+        }
+    }
+    drop(engine); // o comando entra na fila antes do encerramento do motor
+    let _ = store.clear_default_sink_state();
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
+    match std::env::args().nth(1).as_deref() {
+        Some("--restore-default") => return restore_default(),
+        Some("--help" | "-h") => {
+            eprintln!("uso: iara-service [--restore-default]\n  --restore-default: devolve a saída padrão anterior se um serviço anterior caiu deixando o Iara como padrão\n  IARA_BUS_NAME: nome no D-Bus (testes)");
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
     let store = match iara_store::Store::from_xdg() {
         Ok(s) => s,
         Err(e) => {
@@ -58,6 +126,8 @@ fn main() -> ExitCode {
     }
     eprintln!("Iara: serviço iniciado (perfil {})", service.profile().id);
     service.run(&rx);
+    // dá tempo de a resposta de `Deactivate` (e as demais pendentes) chegar ao cliente antes de largar o barramento
+    std::thread::sleep(std::time::Duration::from_millis(300));
     eprintln!("Iara: serviço encerrado");
     ExitCode::SUCCESS
 }

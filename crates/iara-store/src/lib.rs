@@ -87,6 +87,46 @@ struct RevisionFile {
     profile: ProfileDto,
 }
 
+/// O que o Iara instalou como saída padrão do sistema e o que havia antes, para restaurar mesmo depois de uma queda
+/// (spec 8.2: restaurar só se o padrão ainda for o instalado pelo mixer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DefaultSinkState {
+    pub schema_version: u32,
+    /// `node.name` instalado como padrão.
+    pub installed: String,
+    /// Padrão configurado antes de instalar; ausente = não havia escolha configurada.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+}
+
+impl DefaultSinkState {
+    pub fn new(installed: impl Into<String>, previous: Option<String>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            installed: installed.into(),
+            previous,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for v in std::iter::once(&self.installed).chain(self.previous.iter()) {
+            if !iara_core::is_valid_text(v, 256) {
+                return Err("nome de dispositivo inválido".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_default_sink(text: &str) -> Result<DefaultSinkState, StoreError> {
+    check_schema(text)?;
+    let st: DefaultSinkState =
+        toml::from_str(text).map_err(|e| StoreError::Parse(e.to_string()))?;
+    st.validate().map_err(StoreError::Invalid)?;
+    Ok(st)
+}
+
 pub struct Store {
     config_dir: PathBuf,
     state_dir: PathBuf,
@@ -243,6 +283,41 @@ impl Store {
 
     fn history_dir(&self, id: &str) -> PathBuf {
         self.state_dir.join("history").join(id)
+    }
+
+    fn default_sink_file(&self) -> PathBuf {
+        self.state_dir.join("default-sink.toml")
+    }
+
+    /// Saída padrão instalada pelo Iara, se houver registro.
+    pub fn load_default_sink_state(&self) -> Result<Option<DefaultSinkState>, StoreError> {
+        match read_with_backup(&self.default_sink_file(), parse_default_sink) {
+            Ok((st, _)) => Ok(Some(st)),
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn save_default_sink_state(&self, st: &DefaultSinkState) -> Result<(), StoreError> {
+        st.validate().map_err(StoreError::Invalid)?;
+        let text = toml::to_string_pretty(st).map_err(|e| StoreError::Invalid(e.to_string()))?;
+        write_atomic(&self.default_sink_file(), &text, |t| {
+            parse_default_sink(t).is_ok()
+        })?;
+        Ok(())
+    }
+
+    /// Apaga o registro (o Iara não é mais dono da saída padrão).
+    pub fn clear_default_sink_state(&self) -> Result<(), StoreError> {
+        let file = self.default_sink_file();
+        for f in [backup_path(&file), file] {
+            match fs::remove_file(f) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
     }
 
     /// Configuração global; sem arquivo, valores padrão (não grava).
@@ -719,6 +794,47 @@ mod tests {
             channel: "media".into(),
         }];
         assert!(s.save_profile(&broken).is_err());
+    }
+
+    #[test]
+    fn default_sink_state_round_trips_survives_corruption_and_clears() {
+        let (_d, s) = store();
+        assert_eq!(s.load_default_sink_state().unwrap(), None);
+        let st = DefaultSinkState::new("iara.unassigned", Some("alsa_output.fone".into()));
+        s.save_default_sink_state(&st).unwrap();
+        assert_eq!(s.load_default_sink_state().unwrap(), Some(st.clone()));
+        // sem padrão anterior configurado também é um estado válido (restaurar = apagar a escolha)
+        let none = DefaultSinkState::new("iara.unassigned", None);
+        s.save_default_sink_state(&none).unwrap();
+        assert_eq!(s.load_default_sink_state().unwrap().unwrap().previous, None);
+        // corrupção do principal: recupera da cópia válida anterior
+        s.save_default_sink_state(&st).unwrap();
+        fs::write(s.default_sink_file(), "lixo [").unwrap();
+        assert_eq!(s.load_default_sink_state().unwrap(), Some(none));
+        // valores hostis são recusados antes de ir ao disco
+        let bad = DefaultSinkState::new("a\nb", None);
+        assert!(s.save_default_sink_state(&bad).is_err());
+        s.clear_default_sink_state().unwrap();
+        assert_eq!(s.load_default_sink_state().unwrap(), None);
+        s.clear_default_sink_state().unwrap();
+    }
+
+    #[test]
+    fn capturing_the_default_output_is_on_by_default_and_old_configs_still_load() {
+        let (_d, s) = store();
+        assert!(s.load_config().unwrap().0.capture_default_output);
+        // arquivo antigo, sem o campo novo: continua legível e assume o padrão
+        fs::create_dir_all(&s.config_dir).unwrap();
+        fs::write(
+            s.config_file(),
+            "schema_version = 1\nautostart = true\nshare_output_device = false\nshare_microphone_device = false\n",
+        )
+        .unwrap();
+        assert!(s.load_config().unwrap().0.capture_default_output);
+        let mut cfg = s.load_config().unwrap().0;
+        cfg.capture_default_output = false;
+        s.save_config(&cfg).unwrap();
+        assert!(!s.load_config().unwrap().0.capture_default_output);
     }
 
     #[test]

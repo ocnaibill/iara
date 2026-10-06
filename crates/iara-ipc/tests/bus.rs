@@ -2,8 +2,8 @@
 use iara_core::edit::{self, EditCommand, MicSend, SendKind};
 use iara_core::{initial_profile, Gain, Profile};
 use iara_ipc::{
-    serve, AppEntry, AppSource, AppState, Client, ClientError, Controller, Server, SessionChoice,
-    State,
+    serve, AppEntry, AppSource, AppState, Client, ClientError, Controller, DefaultOutput, Server,
+    SessionChoice, State,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,16 @@ impl Controller for Fake {
                 state: AppState::DontMove,
                 streams: 2,
             }],
+            default_output: DefaultOutput::Released,
         })
+    }
+
+    fn deactivate(&self) -> Result<(), String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .push(("<deactivate>".into(), SessionChoice::Clear));
+        Ok(())
     }
 
     fn session_choice(&self, key: String, choice: SessionChoice) -> Result<u64, String> {
@@ -318,4 +327,32 @@ fn apps_travel_in_the_state_and_session_choices_reach_the_service() {
     assert!(
         matches!(client.session_choice("", &SessionChoice::Clear), Err(ClientError::Rejected(m)) if m.contains("vazia"))
     );
+}
+
+#[test]
+fn the_default_output_status_and_deactivate_travel_over_the_wire() {
+    let Some((name, fake, _server)) = start() else {
+        return;
+    };
+    let client = Client::connect(name).unwrap();
+    assert_eq!(
+        client.state().unwrap().default_output,
+        DefaultOutput::Released
+    );
+    client.deactivate().unwrap();
+    assert!(fake
+        .sessions
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(k, _)| k == "<deactivate>"));
+    for d in [
+        DefaultOutput::Disabled,
+        DefaultOutput::Waiting,
+        DefaultOutput::Active,
+        DefaultOutput::Released,
+    ] {
+        assert_eq!(DefaultOutput::parse(d.as_str()), Some(d));
+    }
+    assert_eq!(DefaultOutput::parse("???"), None);
 }

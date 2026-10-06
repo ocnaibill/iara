@@ -41,6 +41,8 @@ pub enum AppState {
     DontMove,
     /// Regra salva, mas o aplicativo não está tocando (não é recusa).
     Waiting,
+    /// Sem regra e usando uma saída própria (escolhida no aplicativo): fica fora do mixer até ser associado a um canal.
+    Outside,
     /// Sem identificação utilizável.
     Unmanaged,
 }
@@ -104,6 +106,41 @@ pub(crate) fn apps_from_toml(text: &str) -> Result<Vec<AppEntry>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Situação da saída principal do Iara como saída padrão do sistema (spec 8.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DefaultOutput {
+    /// Desligado por configuração (desenvolvimento).
+    Disabled,
+    /// Ainda não instalada: falta uma saída física preferida presente (instalar sem ela deixaria o sistema mudo).
+    #[default]
+    Waiting,
+    /// O Iara é a saída padrão: aplicativos novos entram pelo mixer.
+    Active,
+    /// O usuário escolheu outra saída depois: respeitado; aplicativos novos não passam pelo mixer.
+    Released,
+}
+
+impl DefaultOutput {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Waiting => "waiting",
+            Self::Active => "active",
+            Self::Released => "released",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "disabled" => Self::Disabled,
+            "waiting" => Self::Waiting,
+            "active" => Self::Active,
+            "released" => Self::Released,
+            _ => return None,
+        })
+    }
+}
+
 /// Escolha temporária (só nesta sessão) para um aplicativo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionChoice {
@@ -123,6 +160,7 @@ pub struct State {
     pub absent_devices: Vec<String>,
     pub reconnect_attempts: u32,
     pub apps: Vec<AppEntry>,
+    pub default_output: DefaultOutput,
 }
 
 /// Quem atende o IPC: o serviço. Chamado de threads do D-Bus; deve responder com prazo.
@@ -132,4 +170,6 @@ pub trait Controller: Send + Sync + 'static {
     fn edit(&self, cmd: EditCommand) -> Result<u64, String>;
     /// Escolha temporária de canal para um aplicativo (chave de identidade); não altera o perfil.
     fn session_choice(&self, key: String, choice: SessionChoice) -> Result<u64, String>;
+    /// “Desligar mixer / voltar ao áudio normal”: restaura a saída padrão anterior (se ainda for a do Iara) e encerra o serviço.
+    fn deactivate(&self) -> Result<(), String>;
 }
