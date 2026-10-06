@@ -397,6 +397,25 @@ está sobre a janela do Iara (uma versão inicial do roteiro, sem essa trava, de
 backend Wayland nativo; popovers foram acionados pela acessibilidade (sem posições no backend X11); Tab/Enter puro para chegar a uma etiqueta e abri-la, e um leitor de tela real (Orca),
 não foram testados.
 
+## Prova 21 — escolha de fone e microfone na janela
+
+Pedido do usuário no teste humano: a coluna MASTER não tinha onde escolher o fone e o microfone que o Iara roteia. Feito: o motor lista os dispositivos físicos (`Audio/Sink` e
+`Audio/Source` que não são do Iara; descrição = `node.description`, depois `node.nick`, depois o nome), o retrato os leva à janela, e a engrenagem do MASTER abre o popover
+"Dispositivos" com a saída (fone ou alto-falantes) e o microfone. O dispositivo preferido do perfil que está ausente continua listado e marcado ("⚠ … (ausente)"), com a explicação de que a
+escolha segue registrada e volta sozinha.
+
+Contra o PipeWire real (dispositivos do desenvolvedor): o serviço enxergou 3 saídas (fifine, Starship/Matisse, HDMI do monitor) e 4 entradas (C922, ezcap, fifine, Starship/Matisse) e nenhum
+nó do Iara. Pelo seletor, com teclado real: escolher a saída gravou a preferência do perfil e criou a ligação `iara.dev.output.out → dispositivo`; escolher o microfone criou a ligação
+`dispositivo → iara.dev.input.in` (compartilhada com o Zen, que seguiu ligado); escolher "Nenhuma saída" apagou a preferência e removeu a ligação. O roteiro `20-janela-entrada-real.sh` ganhou
+essa seção (31 verificações; 4 rodadas seguidas 31/31).
+
+Achados: (1) a lista aberta do seletor só confirma a escolha com Enter; a seleção por acessibilidade apenas move o cursor; (2) o nome acessível do `GtkDropDown` era o valor atual
+("Nenhuma saída…"), não a finalidade; passou a ser a finalidade ligando o seletor ao seu rótulo (`LabelledBy`); (3) uma das rodadas do roteiro teve 5 falhas intermitentes em seções
+anteriores (1 de 6 rodadas), sem causa estabelecida.
+
+Limites: desconectar um dispositivo de verdade com a janela aberta não foi exercitado (a ausência foi vista em captura de demonstração e provada no motor e no serviço); compartilhar os
+dispositivos entre perfis (spec 8.12) e alternativas autorizadas não existem.
+
 ### O que isto NÃO prova
 
 - Medições longas (horas), CPU com medidores de nível ativos e com efeitos; o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.

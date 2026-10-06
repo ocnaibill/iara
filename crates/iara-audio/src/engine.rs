@@ -53,6 +53,8 @@ pub enum Event {
     DeviceBack(String),
     /// Estado dos aplicativos (fluxos de reprodução agrupados por aplicativo) quando algo muda.
     Apps(Vec<AppReport>),
+    /// Dispositivos físicos de áudio presentes agora (saídas e entradas), quando a lista muda.
+    Devices(Vec<crate::DeviceInfo>),
     /// Saída padrão do sistema mudou: a configurada (a que o usuário ou o Iara escolheram) e a efetiva (a que vale agora).
     DefaultSink {
         configured: Option<String>,
@@ -277,6 +279,9 @@ struct State {
     routes: HashMap<String, RouteTarget>,
     attempts: Attempts,
     last_report: Option<Vec<AppReport>>,
+    /// Dispositivos físicos (saídas e entradas) por id do nó, e a última lista enviada.
+    devices_seen: HashMap<u32, crate::DeviceInfo>,
+    last_devices: Option<Vec<crate::DeviceInfo>>,
 }
 
 fn props_pod(prop: u32, value: Value) -> Vec<u8> {
@@ -466,6 +471,15 @@ fn observe_streams(st: &State) -> Vec<StreamObs> {
             }
         })
         .collect()
+}
+
+/// Avisa quando a lista de dispositivos físicos muda.
+fn report_devices(st: &mut State, ev: &EventSink) {
+    let list = crate::devices::sorted(st.devices_seen.values().cloned().collect());
+    if st.last_devices.as_ref() != Some(&list) {
+        st.last_devices = Some(list.clone());
+        ev(Event::Devices(list));
+    }
 }
 
 /// Decide e executa o roteamento dos fluxos e avisa quando o relatório de aplicativos muda.
@@ -722,6 +736,19 @@ fn run(
                     .borrow_mut()
                     .nodes_present
                     .insert(g.id, name.to_owned());
+                // Dispositivos físicos que o usuário pode escolher como saída (fone) ou entrada (microfone).
+                {
+                    let get = |k: &str| props.and_then(|p| p.get(k));
+                    if let Some(d) = crate::devices::classify(
+                        name,
+                        get("media.class"),
+                        get("node.description"),
+                        get("node.nick"),
+                        get("iara.managed") == Some("true"),
+                    ) {
+                        st_add.borrow_mut().devices_seen.insert(g.id, d);
+                    }
+                }
                 // Fluxos de reprodução de aplicativos (os do próprio Iara não entram no inventário).
                 if props.and_then(|p| p.get("media.class")) == Some("Stream/Output/Audio")
                     && !name.starts_with(NODE_PREFIX)
@@ -808,6 +835,7 @@ fn run(
                 let mut st = st_rm.borrow_mut();
                 st.seen.retain(|_, (gid, _)| *gid != id);
                 st.nodes_present.remove(&id);
+                st.devices_seen.remove(&id);
                 st.streams.remove(&id);
                 st.stream_nodes.remove(&id);
                 st.links.remove(&id);
@@ -833,6 +861,7 @@ fn run(
             }
             reconcile_devices(&mut st.borrow_mut(), &ctx, &ev);
             reconcile_routes(&mut st.borrow_mut(), &ev);
+            report_devices(&mut st.borrow_mut(), &ev);
             reap_retiring(&mut st.borrow_mut(), &core_t);
             check_pending(&st, false);
         })

@@ -367,6 +367,10 @@ Ao ativar, “Iara — Saída principal” (`iara.unassigned`) vira a saída pad
 
 Operações: trocar, criar (com os canais iniciais e os dispositivos do ativo; não troca), duplicar (do estado atual, inclusive ajustes ainda não gravados), renomear e excluir (para a lixeira em `$XDG_STATE_HOME/iara/trash/`, recuperável; nunca o ativo nem o último). A troca (spec 8.4) valida o destino antes de qualquer mudança, grava o perfil atual, herda os dispositivos se o novo não tiver os seus, encerra as escolhas só desta sessão, cria os objetos novos, redireciona os aplicativos (um destino só é usado quando já tem portas de entrada) e só então remove os canais obsoletos (esperando os aplicativos saírem, no máximo 5 s). Medido: 0 fluxos na saída física durante trocas repetidas. A janela tem um menu no cabeçalho com a lista de perfis, o ativo marcado, e criar/duplicar/renomear/excluir (exclusão em duas etapas).
 
+### 9.5 Dispositivos na janela (implementado)
+
+A engrenagem da coluna MASTER abre o popover “Dispositivos”, com a saída (fone ou alto-falantes) e o microfone que o Iara roteia, escolhidos entre os dispositivos físicos presentes; cada perfil guarda os seus (spec 8.12, sem a opção de compartilhar ainda). “Nenhuma” remove a ligação daquele lado. Um dispositivo preferido ausente continua listado e marcado, e volta sozinho quando reaparecer. A saída preferida também é adotada do padrão do sistema na primeira execução com captura da saída padrão (9.3).
+
 ## 10. Requisitos de qualidade
 
 - Restaurar escolhas após reinício e mudanças de ordem de abertura dos aplicativos.
@@ -497,3 +501,4 @@ Consultadas em 05/10/2026. Fundamentam capacidades existentes; os comportamentos
 - **0.10.9 — 05/10/2026:** saída padrão do sistema (9.3): instalação condicionada a uma saída física presente, anterior gravado em disco, posse largada se o usuário trocar, restauração ao desligar e `--restore-default`; encerramento do motor com descarga.
 - **0.10.10 — 05/10/2026:** perfis (9.4): trocar, criar, duplicar, renomear e excluir (lixeira); troca sem vazamento para a saída física, com remoção diferida de canais obsoletos e destino só quando tem portas de entrada.
 - **0.10.11 — 06/10/2026:** janela exercitada com entrada real (prova 20): arrastar e soltar corrigido (era impossível), passos de teclado de 1 dB/6 dB, nomes acessíveis por canal e confirmação de exclusão segura.
+- **0.10.12 — 06/10/2026:** escolha de fone e microfone na janela (9.5), pedida no teste humano; inventário de dispositivos físicos no motor, no serviço e no IPC.

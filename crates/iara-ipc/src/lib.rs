@@ -151,7 +151,8 @@ pub enum SessionChoice {
 }
 
 /// O retrato como trafega no D-Bus (assinatura `tsbsasussa(ssb)`): versão, perfil em TOML, conectado, erro de gravação,
-/// dispositivos ausentes, tentativas de reconexão, aplicativos em TOML, saída padrão e perfis (id, nome, legível).
+/// dispositivos ausentes, tentativas de reconexão, aplicativos em TOML, saída padrão, perfis (id, nome, legível) e dispositivos
+/// físicos de áudio (chave, descrição, é saída).
 pub(crate) type StateWire = (
     u64,
     String,
@@ -162,7 +163,18 @@ pub(crate) type StateWire = (
     String,
     String,
     Vec<(String, String, bool)>,
+    Vec<(String, String, bool)>,
 );
+
+/// Dispositivo físico de áudio que o usuário pode escolher (fone/alto-falantes ou microfone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceEntry {
+    /// Chave persistente (hoje o `node.name`).
+    pub key: String,
+    pub description: String,
+    /// `true` = saída; `false` = entrada.
+    pub output: bool,
+}
 
 /// Perfil na lista do retrato.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +217,8 @@ pub struct State {
     pub apps: Vec<AppEntry>,
     pub default_output: DefaultOutput,
     pub profiles: Vec<ProfileEntry>,
+    /// Dispositivos físicos presentes agora.
+    pub devices: Vec<DeviceEntry>,
 }
 
 /// Quem atende o IPC: o serviço. Chamado de threads do D-Bus; deve responder com prazo.

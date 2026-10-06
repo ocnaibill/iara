@@ -6,8 +6,10 @@
 //! PipeWire cair, o motor emite `Event::Disconnected` e encerra; quem reconstrói é o serviço (spec 8.8).
 
 mod defaults;
+pub mod devices;
 mod engine;
 pub mod routing;
 
+pub use devices::DeviceInfo;
 pub use engine::{ApplyReport, Engine, EngineError, Event, EventSink};
 pub use routing::{AppReport, AppRouteState, RouteTarget, StreamReport, StreamState};

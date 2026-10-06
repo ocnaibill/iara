@@ -66,6 +66,17 @@ if __name__=='__main__':
             if inside and role=='label' and name in ('APLICATIVOS','NÃO ATRIBUÍDOS','MASTER','GAME','CHAT','MEDIA','AUX','MIC') and name!=sys.argv[2]: break
             if inside and role=='toggle button' and ' — ' in name and name.split(' — ')[0] and 'participa' not in name and 'silenciar' not in name: out.append(name.split(' — ')[0])
         print('\n'.join(out))
+    elif cmd=='pick':
+        # escolhe, numa lista aberta (ex.: seletor de dispositivo), o item cujo rótulo começa com o texto dado;
+        # a confirmação é com Enter (teclado real), como faria uma pessoa
+        for d, r, n, e, v, node in walk(app()):
+            if v and r == 'label' and n.startswith(sys.argv[2]):
+                item = node.get_parent().get_parent()
+                if item.get_role_name() == 'list item':
+                    ok = item.get_parent().get_selection_iface().select_child(item.get_index_in_parent())
+                    print('ok' if ok else 'falhou'); break
+        else:
+            print('item não achado')
     elif cmd=='pos':
         n,e=find(sys.argv[2], sys.argv[3] if len(sys.argv)>3 else None)
         print(f"{e.x} {e.y} {e.width} {e.height}" if e else "none")

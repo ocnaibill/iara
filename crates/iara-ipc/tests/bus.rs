@@ -3,7 +3,7 @@ use iara_core::edit::{self, EditCommand, MicSend, SendKind};
 use iara_core::{initial_profile, Gain, Profile};
 use iara_ipc::{
     serve, AppEntry, AppSource, AppState, Client, ClientError, Controller, DefaultOutput,
-    ProfileEntry, ProfileOp, Server, SessionChoice, State,
+    DeviceEntry, ProfileEntry, ProfileOp, Server, SessionChoice, State,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,6 +38,18 @@ impl Controller for Fake {
                 streams: 2,
             }],
             default_output: DefaultOutput::Released,
+            devices: vec![
+                DeviceEntry {
+                    key: "alsa_output.fone".into(),
+                    description: "Fone P2".into(),
+                    output: true,
+                },
+                DeviceEntry {
+                    key: "alsa_input.mic".into(),
+                    description: "Microfone USB".into(),
+                    output: false,
+                },
+            ],
             profiles: vec![
                 ProfileEntry {
                     id: "default".into(),
@@ -429,4 +441,16 @@ fn profiles_travel_in_the_state_and_every_profile_operation_reaches_the_service(
         client.profile_op(&ProfileOp::Switch("nao-existe".into())),
         Err(ClientError::Rejected(m)) if m.contains("desconhecido")
     ));
+}
+
+#[test]
+fn physical_devices_travel_in_the_state() {
+    let Some((name, fake, _server)) = start() else {
+        return;
+    };
+    let st = Client::connect(name).unwrap().state().unwrap();
+    assert_eq!(st.devices, fake.state().unwrap().devices);
+    assert_eq!(st.devices.len(), 2);
+    assert!(st.devices[0].output && !st.devices[1].output);
+    assert_eq!(st.devices[1].description, "Microfone USB");
 }

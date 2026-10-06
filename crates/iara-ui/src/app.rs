@@ -3,9 +3,9 @@
 
 use crate::backend::{Backend, OnUpdate, Update};
 use crate::model::{
-    active_profile_label, chatmix_view, chips_by_column, columns, move_app, position_to_gain,
-    profile_rows, reapply_rule, slug, status_lines, AppChip, ColumnKind, ColumnView, SendView,
-    StatusKind, UiCommand,
+    active_profile_label, chatmix_view, chips_by_column, columns, device_choices, move_app,
+    position_to_gain, profile_rows, reapply_rule, slug, status_lines, AppChip, ColumnKind,
+    ColumnView, SendView, StatusKind, UiCommand,
 };
 use gtk::prelude::*;
 use gtk::{gdk, glib};
@@ -81,6 +81,159 @@ struct AppsCtx {
     channels: Rc<RefCell<Vec<(String, String)>>>,
     /// Interruptor do cabeçalho: mover só nesta sessão em vez de salvar a regra.
     session_only: Rc<Cell<bool>>,
+    /// Engrenagem da coluna MASTER: escolha do fone (saída) e do microfone que o Iara vai rotear.
+    device_button: gtk::MenuButton,
+}
+
+/// Seletores de dispositivo físico dentro do popover da engrenagem do MASTER.
+struct DevicePicker {
+    output: gtk::DropDown,
+    input: gtk::DropDown,
+    output_hint: gtk::Label,
+    input_hint: gtk::Label,
+    /// Chaves das opções atuais de cada seletor (índice → chave; `None` = nenhum).
+    output_keys: Rc<RefCell<Vec<Option<String>>>>,
+    input_keys: Rc<RefCell<Vec<Option<String>>>>,
+    sig: RefCell<String>,
+}
+
+fn dropdown_selector(
+    caption: &str,
+    accessible: &str,
+    keys: &Rc<RefCell<Vec<Option<String>>>>,
+    updating: &Rc<Cell<bool>>,
+    on_pick: impl Fn(Option<String>) + 'static,
+) -> (gtk::Box, gtk::DropDown, gtk::Label) {
+    let bx = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let cap = label(caption, "strip-caption");
+    bx.append(&cap);
+    let dd = gtk::DropDown::from_strings(&["…"]);
+    // sem isto o leitor de tela anuncia só o valor atual ("Nenhuma saída…"), não a finalidade do seletor
+    dd.update_property(&[gtk::accessible::Property::Label(accessible)]);
+    dd.update_relation(&[gtk::accessible::Relation::LabelledBy(&[cap.upcast_ref()])]);
+    let hint = label("", "note");
+    hint.set_xalign(0.0);
+    hint.set_wrap(true);
+    {
+        let (keys, updating) = (keys.clone(), updating.clone());
+        dd.connect_selected_notify(move |d| {
+            if updating.get() {
+                return;
+            }
+            if let Some(key) = keys.borrow().get(d.selected() as usize) {
+                on_pick(key.clone());
+            }
+        });
+    }
+    bx.append(&dd);
+    bx.append(&hint);
+    (bx, dd, hint)
+}
+
+/// Engrenagem + popover "Dispositivos" da coluna MASTER (spec 8.5, 8.6, 8.12).
+fn build_device_menu(emit: &Emit, updating: &Rc<Cell<bool>>) -> (gtk::MenuButton, DevicePicker) {
+    let pop = gtk::Popover::new();
+    let bx = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    for set in [
+        gtk::Widget::set_margin_top,
+        gtk::Widget::set_margin_bottom,
+        gtk::Widget::set_margin_start,
+        gtk::Widget::set_margin_end,
+    ] {
+        set(bx.upcast_ref(), 12);
+    }
+    bx.set_size_request(300, -1);
+    bx.append(&label("DISPOSITIVOS", "col-title"));
+    let intro = label(
+        "O Iara cuida do roteamento: a escuta sai pela saída escolhida e o microfone entra pelo que você escolher. \
+         Cada perfil guarda os seus.",
+        "muted-text",
+    );
+    intro.set_wrap(true);
+    intro.set_xalign(0.0);
+    bx.append(&intro);
+    let output_keys: Rc<RefCell<Vec<Option<String>>>> = Rc::default();
+    let input_keys: Rc<RefCell<Vec<Option<String>>>> = Rc::default();
+    let (e1, e2) = (emit.clone(), emit.clone());
+    let (out_box, output, output_hint) = dropdown_selector(
+        "SAÍDA (FONE OU ALTO-FALANTES)",
+        "Saída do mix pessoal (fone ou alto-falantes)",
+        &output_keys,
+        updating,
+        move |key| e1(EditCommand::SetPreferredOutput(key)),
+    );
+    let (in_box, input, input_hint) = dropdown_selector(
+        "MICROFONE",
+        "Entrada do microfone",
+        &input_keys,
+        updating,
+        move |key| e2(EditCommand::SetPreferredMicrophone(key)),
+    );
+    bx.append(&out_box);
+    bx.append(&in_box);
+    pop.set_child(Some(&bx));
+    let button = gtk::MenuButton::builder()
+        .icon_name("emblem-system-symbolic")
+        .tooltip_text("Dispositivos: fone e microfone")
+        .popover(&pop)
+        .build();
+    button.add_css_class("flat");
+    button.update_property(&[gtk::accessible::Property::Label(
+        "Configurações de dispositivos: fone e microfone",
+    )]);
+    (
+        button,
+        DevicePicker {
+            output,
+            input,
+            output_hint,
+            input_hint,
+            output_keys,
+            input_keys,
+            sig: RefCell::new(String::new()),
+        },
+    )
+}
+
+impl DevicePicker {
+    /// Refaz as opções só quando mudam (reconstruir com a lista aberta a fecharia) e marca a escolha atual.
+    fn refresh(&self, state: &State) {
+        let (outs, out_sel) = device_choices(state, true);
+        let (ins, in_sel) = device_choices(state, false);
+        let sig = format!("{outs:?}{out_sel}{ins:?}{in_sel}");
+        if *self.sig.borrow() == sig {
+            return;
+        }
+        *self.sig.borrow_mut() = sig;
+        for (dd, choices, sel, keys, hint) in [
+            (
+                &self.output,
+                &outs,
+                out_sel,
+                &self.output_keys,
+                &self.output_hint,
+            ),
+            (
+                &self.input,
+                &ins,
+                in_sel,
+                &self.input_keys,
+                &self.input_hint,
+            ),
+        ] {
+            *keys.borrow_mut() = choices.iter().map(|c| c.key.clone()).collect();
+            let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
+            dd.set_model(Some(&gtk::StringList::new(&labels)));
+            dd.set_selected(sel as u32);
+            hint.set_text(if choices[sel].absent {
+                "Este dispositivo não está conectado agora; a escolha continua registrada e volta sozinha quando ele reaparecer."
+            } else if choices[sel].key.is_none() {
+                "Sem dispositivo escolhido: este lado fica sem som."
+            } else {
+                ""
+            });
+        }
+    }
 }
 
 struct Strip {
@@ -440,6 +593,9 @@ fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &Ap
     title.set_hexpand(true);
     title.set_xalign(0.0);
     head.append(&title);
+    if v.kind == ColumnKind::Master {
+        head.append(&ctx.device_button);
+    }
     if v.kind == ColumnKind::Channel {
         let others: Vec<(String, String)> = ctx
             .channels
@@ -745,6 +901,7 @@ struct Ui {
     /// Id do perfil ativo (para "duplicar/renomear o ativo").
     active_profile: Rc<RefCell<String>>,
     emit_ui: EmitUi,
+    devices: DevicePicker,
     profile_pop: gtk::Popover,
     /// Último retrato recebido (para refazer o menu de perfis ao fechá-lo).
     last_state: RefCell<Option<State>>,
@@ -899,6 +1056,7 @@ impl Ui {
         self.profile.set_label(&active_profile_label(state));
         *self.active_profile.borrow_mut() = state.profile.id.clone();
         self.refresh_profile_menu(state);
+        self.devices.refresh(state);
         *self.ctx.apps.borrow_mut() = state.apps.clone();
         *self.ctx.channels.borrow_mut() = state
             .profile
@@ -1003,6 +1161,8 @@ pub fn demo_state() -> State {
         },
         E::SetMicInputGain(g(-18.0)),
         E::SetChatMixPosition(0.35),
+        E::SetPreferredOutput(Some("alsa_output.fone".into())),
+        E::SetPreferredMicrophone(Some("alsa_input.usb-microfone-desconectado".into())),
     ] {
         p = apply(&p, &cmd).expect("demo").0;
     }
@@ -1025,6 +1185,28 @@ pub fn demo_state() -> State {
         absent_devices: vec!["alsa_output.usb-fone-exemplo".into()],
         reconnect_attempts: 0,
         default_output: DefaultOutput::Active,
+        devices: vec![
+            iara_ipc::DeviceEntry {
+                key: "alsa_output.fone".into(),
+                description: "Fone (saída analógica)".into(),
+                output: true,
+            },
+            iara_ipc::DeviceEntry {
+                key: "alsa_output.hdmi".into(),
+                description: "Monitor HDMI".into(),
+                output: true,
+            },
+            iara_ipc::DeviceEntry {
+                key: "alsa_input.fifine".into(),
+                description: "fifine AM8 Pro Mono".into(),
+                output: false,
+            },
+            iara_ipc::DeviceEntry {
+                key: "alsa_input.webcam".into(),
+                description: "Webcam C922".into(),
+                output: false,
+            },
+        ],
         profiles: vec![
             iara_ipc::ProfileEntry {
                 id: "default".into(),
@@ -1104,12 +1286,17 @@ pub fn demo_state() -> State {
 }
 
 fn save_png(window: &gtk::ApplicationWindow, path: &std::path::Path) -> Result<(), String> {
-    let paintable = gtk::WidgetPaintable::new(Some(window));
-    let (w, h) = (window.width() as f64, window.height() as f64);
+    save_widget_png(window.upcast_ref::<gtk::Widget>(), path)
+}
+
+/// Renderiza qualquer widget com superfície própria (janela, popover) em PNG, sem ferramenta de captura de tela.
+fn save_widget_png(widget: &gtk::Widget, path: &std::path::Path) -> Result<(), String> {
+    let paintable = gtk::WidgetPaintable::new(Some(widget));
+    let (w, h) = (widget.width() as f64, widget.height() as f64);
     let snapshot = gtk::Snapshot::new();
     paintable.snapshot(snapshot.upcast_ref::<gdk::Snapshot>(), w, h);
     let node = snapshot.to_node().ok_or("nada renderizado")?;
-    let renderer = window
+    let renderer = widget
         .native()
         .and_then(|n| n.renderer())
         .ok_or("sem renderer")?;
@@ -1144,11 +1331,14 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
         let e = emit_ui.clone();
         Rc::new(move |cmd| e(UiCommand::Edit(cmd)))
     };
+    let updating = Rc::new(Cell::new(false));
+    let (device_button, devices) = build_device_menu(&emit, &updating);
     let ctx = AppsCtx {
         emit: emit_ui,
         apps: Rc::default(),
         channels: Rc::default(),
         session_only: Rc::new(Cell::new(false)),
+        device_button,
     };
 
     let window = gtk::ApplicationWindow::builder()
@@ -1320,7 +1510,6 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
     outer.append(&cm_root);
     window.set_child(Some(&outer));
 
-    let updating = Rc::new(Cell::new(false));
     {
         let (e, u) = (emit.clone(), updating.clone());
         scale.connect_value_changed(move |s| {
@@ -1380,6 +1569,8 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
     add_button.add_css_class("add");
     add_button.update_property(&[gtk::accessible::Property::Label("Novo canal")]);
 
+    let ctx_device_button = ctx.device_button.clone();
+    let profile_button = profile.clone();
     let ui = Rc::new(Ui {
         window: window.clone(),
         banner,
@@ -1388,6 +1579,7 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
         profile_sig: RefCell::new(String::new()),
         active_profile,
         emit_ui: ctx.emit.clone(),
+        devices,
         profile_pop: profile_pop.clone(),
         last_state: RefCell::new(None),
         row,
@@ -1457,10 +1649,31 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
     // recurso de desenvolvimento: `kill -USR1 <pid>` grava a janela em $IARA_UI_SHOT_PATH, sem encerrar o app
     if let Some(path) = std::env::var_os("IARA_UI_SHOT_PATH").map(PathBuf::from) {
         let w = window.clone();
+        let path_main = path.clone();
         glib::unix_signal_add_local(10, move || {
-            match save_png(&w, &path) {
-                Ok(()) => eprintln!("captura salva em {}", path.display()),
+            match save_png(&w, &path_main) {
+                Ok(()) => eprintln!("captura salva em {}", path_main.display()),
                 Err(e) => eprintln!("falha na captura: {e}"),
+            }
+            glib::ControlFlow::Continue
+        });
+        // `kill -USR2`: grava os popovers abertos (menus de perfis e de dispositivos) ao lado, com sufixo
+        let (menus, base) = (
+            vec![
+                ("dispositivos", ctx_device_button.clone()),
+                ("perfis", profile_button.clone()),
+            ],
+            path.clone(),
+        );
+        glib::unix_signal_add_local(12, move || {
+            for (name, button) in &menus {
+                if let Some(pop) = button.popover().filter(|p| p.is_visible()) {
+                    let out = base.with_file_name(format!("popover-{name}.png"));
+                    match save_widget_png(pop.upcast_ref::<gtk::Widget>(), &out) {
+                        Ok(()) => eprintln!("popover salvo em {}", out.display()),
+                        Err(e) => eprintln!("falha no popover {name}: {e}"),
+                    }
+                }
             }
             glib::ControlFlow::Continue
         });

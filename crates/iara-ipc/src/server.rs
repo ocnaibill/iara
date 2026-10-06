@@ -60,6 +60,10 @@ pub(crate) fn state_to_tuple(s: &State) -> Result<crate::StateWire, String> {
             .iter()
             .map(|p| (p.id.clone(), p.name.clone(), p.readable))
             .collect(),
+        s.devices
+            .iter()
+            .map(|d| (d.key.clone(), d.description.clone(), d.output))
+            .collect(),
     ))
 }
 

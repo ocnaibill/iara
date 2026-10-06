@@ -100,6 +100,7 @@ impl Client {
             apps,
             default_output,
             profiles,
+            devices,
         ): crate::StateWire = self.proxy.call("GetState", &())?;
         let apps = crate::apps_from_toml(&apps).map_err(ClientError::Rejected)?;
         let profile = iara_store::profile_from_toml(&toml)
@@ -116,6 +117,14 @@ impl Client {
             profiles: profiles
                 .into_iter()
                 .map(|(id, name, readable)| crate::ProfileEntry { id, name, readable })
+                .collect(),
+            devices: devices
+                .into_iter()
+                .map(|(key, description, output)| crate::DeviceEntry {
+                    key,
+                    description,
+                    output,
+                })
                 .collect(),
         })
     }

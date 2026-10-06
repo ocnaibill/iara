@@ -121,5 +121,27 @@ check "um clique em 'excluir' depois de fechar e reabrir NÃO exclui (confirmaç
 $AT act "Confirmar a exclusão do perfil Padrão" >/dev/null 2>&1; sleep 1.5
 check "a segunda etapa (confirmação) exclui e manda para a lixeira" '[ "$(profiles | cut -d"|" -f2)" = "teste" ] && ls "$XDG_STATE_HOME"/iara/trash | grep -q default'
 
+echo "== dispositivos (engrenagem do MASTER)"
+dev_json() { state_json | /usr/bin/python3 -c "
+import json,sys,tomllib
+d=json.load(sys.stdin)['data']; p=tomllib.loads(d[1])
+print(json.dumps({'out': p.get('devices',{}).get('output'), 'mic': p.get('devices',{}).get('microphone'), 'n_out': sum(1 for x in d[9] if x[2]), 'n_in': sum(1 for x in d[9] if not x[2]), 'keys': [x[0] for x in d[9]]}))"; }
+dj=$(dev_json)
+check "o serviço lista dispositivos físicos reais (saídas e entradas) e nenhum nó do Iara" 'echo "$dj" | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d[\"n_out\"]>0 and d[\"n_in\"]>0 and not any(k.startswith(\"iara.\") for k in d[\"keys\"]) else 1)"'
+OUT_KEY=$(echo "$dj" | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin); print(next(k for k in d['keys'] if k.startswith('alsa_output')))")
+OUT_DESC=$(state_json | /usr/bin/python3 -c "
+import json,sys
+d=json.load(sys.stdin)['data']; k='$OUT_KEY'; print(next(x[1] for x in d[9] if x[0]==k))")
+$AT act "Configurações de dispositivos: fone e microfone" >/dev/null 2>&1; sleep 0.8
+check "a engrenagem do MASTER abre o popover de dispositivos" '$AT dump label 2>/dev/null | grep -q DISPOSITIVOS'
+check "os seletores têm nome pela finalidade (não pelo valor atual)" '$AT dump "combo box" 2>/dev/null | grep -q "SAÍDA (FONE OU ALTO-FALANTES)" && $AT dump "combo box" 2>/dev/null | grep -q MICROFONE'
+$AT act "SAÍDA (FONE OU ALTO-FALANTES)" >/dev/null 2>&1; sleep 0.8
+$AT pick "$OUT_DESC" >/dev/null 2>&1; sleep 0.4; xdotool key Return; sleep 2.5
+check "escolher a saída no seletor grava a preferência do perfil" '[ "$(dev_json | /usr/bin/python3 -c "import json,sys; print(json.load(sys.stdin)[\"out\"])")" = "$OUT_KEY" ]'
+check "e o Iara liga o mix pessoal a esse dispositivo" '/usr/bin/python3 "$HERE/lib_links.py" iara.dev.output.out 2>/dev/null | grep -q "$(echo "$OUT_KEY" | cut -c1-14)"'
+$AT act "SAÍDA (FONE OU ALTO-FALANTES)" >/dev/null 2>&1; sleep 0.8
+$AT pick "Nenhuma saída" >/dev/null 2>&1; sleep 0.4; xdotool key Return; sleep 2.5
+check "escolher 'Nenhuma saída' apaga a preferência e remove a ligação" '[ "$(dev_json | /usr/bin/python3 -c "import json,sys; print(json.load(sys.stdin)[\"out\"])")" = None ] && /usr/bin/python3 "$HERE/lib_links.py" iara.dev.output.out 2>/dev/null | grep -q AUSENTE'
+
 echo; echo "resultado: $PASS ok, $FAIL falhas"
 [ "$FAIL" = 0 ]

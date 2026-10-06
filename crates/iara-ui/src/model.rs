@@ -325,6 +325,59 @@ pub fn reapply_rule(app: &AppEntry) -> Option<UiCommand> {
     })
 }
 
+/// Uma opção do seletor de dispositivo (saída ou microfone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceChoice {
+    /// Chave persistente do dispositivo; `None` = "nenhum" (o Iara não liga esse lado).
+    pub key: Option<String>,
+    pub label: String,
+    /// O dispositivo é o preferido do perfil mas não está presente agora (continua registrado; spec 8.5/8.6).
+    pub absent: bool,
+}
+
+/// Opções do seletor de saída (`output = true`) ou de microfone e qual está escolhida. A primeira é sempre "nenhum".
+/// O dispositivo preferido do perfil aparece mesmo ausente, marcado, para a escolha não "sumir" ao desconectar o fone.
+pub fn device_choices(state: &State, output: bool) -> (Vec<DeviceChoice>, usize) {
+    let preferred = if output {
+        state.profile.preferred_output.as_ref()
+    } else {
+        state.profile.preferred_microphone.as_ref()
+    }
+    .map(|d| d.persistent_key.clone());
+    let none_label = if output {
+        "Nenhuma saída (sem áudio na escuta)"
+    } else {
+        "Nenhum microfone"
+    };
+    let mut out = vec![DeviceChoice {
+        key: None,
+        label: none_label.to_owned(),
+        absent: false,
+    }];
+    let mut selected = 0;
+    for d in state.devices.iter().filter(|d| d.output == output) {
+        if preferred.as_deref() == Some(d.key.as_str()) {
+            selected = out.len();
+        }
+        out.push(DeviceChoice {
+            key: Some(d.key.clone()),
+            label: d.description.clone(),
+            absent: false,
+        });
+    }
+    if let Some(p) = preferred {
+        if !out.iter().any(|c| c.key.as_deref() == Some(p.as_str())) {
+            selected = out.len();
+            out.push(DeviceChoice {
+                label: format!("⚠ {p} (ausente)"),
+                key: Some(p),
+                absent: true,
+            });
+        }
+    }
+    (out, selected)
+}
+
 /// Linha do menu de perfis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileRow {
@@ -478,6 +531,7 @@ mod tests {
             apps: vec![],
             default_output: DefaultOutput::Active,
             profiles: vec![],
+            devices: vec![],
         }
     }
 
@@ -926,5 +980,45 @@ mod tests {
         // o único perfil não pode ser excluído
         s.profiles = vec![pe("default", "Padrão", true)];
         assert!(!profile_rows(&s)[0].can_delete);
+    }
+
+    #[test]
+    fn device_choices_list_present_devices_select_the_preferred_and_keep_an_absent_one_visible() {
+        use iara_ipc::DeviceEntry;
+        let dev = |k: &str, d: &str, o: bool| DeviceEntry {
+            key: k.into(),
+            description: d.into(),
+            output: o,
+        };
+        let mut s = state(initial_profile());
+        s.devices = vec![
+            dev("alsa_output.fone", "Fone P2", true),
+            dev("alsa_output.hdmi", "Monitor HDMI", true),
+            dev("alsa_input.fifine", "fifine AM8", false),
+        ];
+        // sem preferência: "nenhum" selecionado; saídas e entradas separadas
+        let (out, sel) = device_choices(&s, true);
+        assert_eq!((out.len(), sel), (3, 0));
+        assert_eq!(out[0].key, None);
+        assert_eq!(device_choices(&s, false).0.len(), 2);
+        // preferido presente: vem selecionado
+        s.profile.preferred_output = Some(iara_core::DevicePreference {
+            persistent_key: "alsa_output.hdmi".into(),
+        });
+        let (out, sel) = device_choices(&s, true);
+        assert_eq!(out[sel].key.as_deref(), Some("alsa_output.hdmi"));
+        assert!(!out[sel].absent);
+        // preferido ausente: continua listado e selecionado, marcado — a escolha não some ao desconectar o fone
+        s.profile.preferred_microphone = Some(iara_core::DevicePreference {
+            persistent_key: "alsa_input.sumiu".into(),
+        });
+        let (inp, sel) = device_choices(&s, false);
+        assert_eq!(inp.len(), 3);
+        assert!(
+            inp[sel].absent
+                && inp[sel].label.starts_with("⚠")
+                && inp[sel].label.contains("ausente")
+        );
+        assert_eq!(inp[sel].key.as_deref(), Some("alsa_input.sumiu"));
     }
 }

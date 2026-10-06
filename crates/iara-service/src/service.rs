@@ -138,6 +138,8 @@ pub struct Status {
     pub apps: Vec<AppReport>,
     /// Situação da saída principal do Iara como saída padrão do sistema.
     pub default_output: DefaultOutput,
+    /// Dispositivos físicos de áudio presentes agora (saídas e entradas).
+    pub devices: Vec<iara_audio::DeviceInfo>,
 }
 
 pub struct Service<B: Backend> {
@@ -543,6 +545,7 @@ impl<B: Backend> Service<B> {
         self.status.connected = false;
         self.status.absent_devices.clear();
         self.status.apps.clear();
+        self.status.devices.clear();
         self.last_routes = None;
         self.default_seen = false;
         if self.retry.is_none() {
@@ -707,6 +710,12 @@ impl<B: Backend> Service<B> {
                     self.changed();
                 }
                 self.evaluate_default(now);
+            }
+            Msg::Engine(Event::Devices(list)) => {
+                if self.status.devices != list {
+                    self.status.devices = list;
+                    self.changed();
+                }
             }
             Msg::Engine(Event::DefaultSink { configured, .. }) => {
                 self.observed_default = configured;

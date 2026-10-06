@@ -5,7 +5,9 @@ use crate::apps::AppView;
 use crate::service::{Command, Msg, Snapshot};
 use iara_core::apps::Source;
 use iara_core::edit::EditCommand;
-use iara_ipc::{AppEntry, AppSource, Controller, ProfileEntry, ProfileOp, SessionChoice, State};
+use iara_ipc::{
+    AppEntry, AppSource, Controller, DeviceEntry, ProfileEntry, ProfileOp, SessionChoice, State,
+};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -44,6 +46,16 @@ pub fn to_state(s: Snapshot) -> State {
     State {
         apps: s.apps.into_iter().map(entry).collect(),
         default_output: s.status.default_output,
+        devices: s
+            .status
+            .devices
+            .into_iter()
+            .map(|d| DeviceEntry {
+                key: d.name,
+                description: d.description,
+                output: d.output,
+            })
+            .collect(),
         profiles: s
             .profiles
             .into_iter()
