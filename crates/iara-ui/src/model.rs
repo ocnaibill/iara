@@ -329,6 +329,7 @@ pub fn reapply_rule(app: &AppEntry) -> Option<UiCommand> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileRow {
     pub id: String,
+    pub name: String,
     pub label: String,
     pub active: bool,
     /// Trocar para ele é possível (legível e não é o ativo).
@@ -357,6 +358,7 @@ pub fn profile_rows(state: &State) -> Vec<ProfileRow> {
             };
             ProfileRow {
                 id: p.id.clone(),
+                name: p.name.clone(),
                 label,
                 active: is_active,
                 can_switch: !is_active && p.readable,

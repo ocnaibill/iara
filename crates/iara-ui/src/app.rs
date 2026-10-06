@@ -56,6 +56,8 @@ window.iara { background: #0e1b22; color: #d8e6ea; }
 .iara menubutton.chip.temp > button { border-style: dashed; border-color: #f2b35e; }
 .iara menubutton.chip.idle > button { color: #7e98a1; background: transparent; }
 .iara menubutton.chip.attention > button { border-color: #ef6f6c; }
+.iara headerbar button:checked, .iara headerbar button.toggle:checked { background: #1d5a54; border: 1px solid #5ad1c5; color: #ffffff; }
+.iara button.flat-btn.armed { background: #5b2a2a; border-color: #ef6f6c; color: #ffd9d8; }
 .iara .column.drop-target { border: 1px dashed #5ad1c5; background: #1a3640; }
 .iara .apps-empty { color: #4f6a74; font-size: 11px; }
 ";
@@ -114,6 +116,13 @@ struct Handlers {
     enable: Option<Box<dyn Fn(bool)>>,
 }
 
+/// Passos de teclado de um slider de ganho: posição 1,0 = 60 dB, então 1 dB = 1/60.
+fn set_gain_steps(scale: &gtk::Scale) {
+    let adj = scale.adjustment();
+    adj.set_step_increment(1.0 / 60.0);
+    adj.set_page_increment(6.0 / 60.0);
+}
+
 fn label(text: &str, class: &str) -> gtk::Label {
     let l = gtk::Label::new(Some(text));
     l.add_css_class(class);
@@ -134,6 +143,7 @@ fn toggle(icon: &str, tooltip: &str, classes: &[&str]) -> gtk::ToggleButton {
 }
 
 fn build_strip(
+    owner: &str,
     caption: &str,
     icon: &str,
     transmission: bool,
@@ -143,7 +153,8 @@ fn build_strip(
     let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
     root.set_halign(gtk::Align::Center);
     let tx = ["enable", if transmission { "tx" } else { "rx" }];
-    let enable = toggle(icon, &format!("{caption}: participa do mix"), &tx);
+    // nomes acessíveis incluem a coluna: sem isso todos os sliders de "ESCUTA" soam iguais para um leitor de tela
+    let enable = toggle(icon, &format!("{owner} — {caption}: participa do mix"), &tx);
     if h.enable.is_none() {
         // sem habilitação (MASTER): o botão fica invisível mas ocupa o lugar, para alinhar os sliders entre colunas
         enable.set_opacity(0.0);
@@ -161,9 +172,17 @@ fn build_strip(
     if transmission {
         scale.add_css_class("tx");
     }
+    // "volume da escuta", "volume da transmissão", "volume para aplicativos"
+    let what = if caption == "APLICATIVOS" {
+        "para aplicativos".to_owned()
+    } else {
+        format!("da {}", caption.to_lowercase())
+    };
     scale.update_property(&[gtk::accessible::Property::Label(&format!(
-        "Volume — {caption}"
+        "{owner} — volume {what}"
     ))]);
+    // teclado: 1 dB por seta e 6 dB por Page (os passos padrão eram de 0,06 dB, inviáveis para ajuste fino)
+    set_gain_steps(&scale);
     let dragging = Rc::new(Cell::new(false));
     let press = gtk::GestureClick::new();
     press.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -183,7 +202,7 @@ fn build_strip(
     note.set_height_request(14);
     let mute = toggle(
         "audio-volume-high-symbolic",
-        &format!("Silenciar — {caption}"),
+        &format!("{owner} — silenciar {}", caption.to_lowercase()),
         &["mute"],
     );
     mute.connect_toggled(|b| {
@@ -338,6 +357,7 @@ fn manage_menu(id: &str, name: &str, others: &[(String, String)], emit: &Emit) -
     bx.set_margin_start(8);
     bx.set_margin_end(8);
     let entry = gtk::Entry::builder().text(name).max_length(64).build();
+    entry.update_property(&[gtk::accessible::Property::Label("Novo nome do canal")]);
     let rename = gtk::Button::with_label("Renomear");
     let remove = gtk::Button::with_label("Remover canal");
     remove.add_css_class("destructive-action");
@@ -402,7 +422,9 @@ fn manage_menu(id: &str, name: &str, others: &[(String, String)], emit: &Emit) -
         .popover(&pop)
         .build();
     mb.add_css_class("flat");
-    mb.update_property(&[gtk::accessible::Property::Label("Configurações do canal")]);
+    mb.update_property(&[gtk::accessible::Property::Label(&format!(
+        "Configurações do canal {name}"
+    ))]);
     mb
 }
 
@@ -450,9 +472,8 @@ fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &Ap
         root.append(&gm);
         let input = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.001);
         input.set_draw_value(false);
-        input.update_property(&[gtk::accessible::Property::Label(
-            "Ganho de entrada do microfone",
-        )]);
+        input.update_property(&[gtk::accessible::Property::Label("MIC — ganho de entrada")]);
+        set_gain_steps(&input);
         let input_value = label(&m.input_label, "value");
         {
             let (e, u) = (emit.clone(), updating.clone());
@@ -490,6 +511,7 @@ fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &Ap
             })),
         };
         let apps = build_strip(
+            "MIC",
             "APLICATIVOS",
             "audio-input-microphone-symbolic",
             true,
@@ -508,6 +530,7 @@ fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &Ap
     strips.set_vexpand(true);
     strips.set_halign(gtk::Align::Center);
     let personal = build_strip(
+        &v.title,
         "ESCUTA",
         "audio-headphones-symbolic",
         false,
@@ -515,6 +538,7 @@ fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &Ap
         kind_handlers(&v.kind, &v.id, SendKind::Personal, emit),
     );
     let transmission = build_strip(
+        &v.title,
         "TRANSMISSÃO",
         "network-wireless-symbolic",
         true,
@@ -557,7 +581,10 @@ fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &Ap
             ctx.clone(),
             (v.kind == ColumnKind::Channel).then(|| v.id.clone()),
         );
+        let r_drop = root.clone();
         target.connect_drop(move |_, value, _, _| {
+            // numa soltura o `leave` não dispara: o realce sai aqui (um segundo handler nunca rodaria, o primeiro devolve true)
+            r_drop.remove_css_class("drop-target");
             let Ok(key) = value.get::<String>() else {
                 return false;
             };
@@ -582,11 +609,6 @@ fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &Ap
         });
         let r = root.clone();
         target.connect_leave(move |_| r.remove_css_class("drop-target"));
-        let r = root.clone();
-        target.connect_drop(move |_, _, _, _| {
-            r.remove_css_class("drop-target");
-            false
-        });
         root.add_controller(target);
         list
     });
@@ -694,8 +716,11 @@ fn build_chip(chip: &AppChip, ctx: &AppsCtx) -> gtk::MenuButton {
     mb.update_property(&[gtk::accessible::Property::Label(&chip.tooltip)]);
     mb.set_halign(gtk::Align::Start);
     if let Some(key) = chip.app.key.clone() {
+        // fase de captura: o botão da etiqueta reivindica o gesto ao ser pressionado; só assim o arrasto o vê primeiro
+        // (e só reivindica depois de passar o limiar de movimento, então o clique que abre o menu segue funcionando)
         let src = gtk::DragSource::builder()
             .actions(gdk::DragAction::MOVE)
+            .propagation_phase(gtk::PropagationPhase::Capture)
             .build();
         src.connect_prepare(move |_, _, _| Some(gdk::ContentProvider::for_value(&key.to_value())));
         mb.add_controller(src);
@@ -720,6 +745,9 @@ struct Ui {
     /// Id do perfil ativo (para "duplicar/renomear o ativo").
     active_profile: Rc<RefCell<String>>,
     emit_ui: EmitUi,
+    profile_pop: gtk::Popover,
+    /// Último retrato recebido (para refazer o menu de perfis ao fechá-lo).
+    last_state: RefCell<Option<State>>,
     row: gtk::Box,
     add_button: gtk::MenuButton,
     chatmix: ChatMixBar,
@@ -786,23 +814,37 @@ impl Ui {
             pick.set_hexpand(true);
             pick.set_sensitive(r.can_switch);
             {
-                let (e, id) = (self.emit_ui.clone(), r.id.clone());
-                pick.connect_clicked(move |_| e(UiCommand::Profile(ProfileOp::Switch(id.clone()))));
+                let (e, id, pop) = (self.emit_ui.clone(), r.id.clone(), self.profile_pop.clone());
+                pick.connect_clicked(move |_| {
+                    e(UiCommand::Profile(ProfileOp::Switch(id.clone())));
+                    pop.popdown(); // escolher um perfil fecha o menu
+                });
             }
             line.append(&pick);
             let trash = gtk::Button::from_icon_name("user-trash-symbolic");
             trash.add_css_class("flat-btn");
             trash.set_sensitive(r.can_delete);
             trash.set_tooltip_text(Some("Excluir (vai para a lixeira, recuperável)"));
-            trash.update_property(&[gtk::accessible::Property::Label("Excluir perfil")]);
+            trash.update_property(&[gtk::accessible::Property::Label(&format!(
+                "Excluir o perfil {}",
+                r.name
+            ))]);
             {
-                // exclusão em duas etapas: o primeiro clique pede confirmação
-                let (e, id) = (self.emit_ui.clone(), r.id.clone());
+                // exclusão em duas etapas: o primeiro clique pede confirmação (e o nome acessível diz o que será excluído);
+                // fechar o menu desfaz a confirmação pendente (ver `profile_pop.connect_closed`)
+                let (e, id, name) = (self.emit_ui.clone(), r.id.clone(), r.name.clone());
                 trash.connect_clicked(move |b| {
-                    if b.label().as_deref() == Some("Excluir?") {
+                    if b.has_css_class("armed") {
                         e(UiCommand::Profile(ProfileOp::Delete(id.clone())));
                     } else {
-                        b.set_label("Excluir?");
+                        // armado: ícone de aviso, borda vermelha e nome acessível de confirmação (o rótulo visual não muda,
+                        // porque trocá-lo faz o GTK sobrescrever o nome acessível)
+                        b.add_css_class("armed");
+                        b.set_icon_name("dialog-warning-symbolic");
+                        b.set_tooltip_text(Some("Clique de novo para excluir"));
+                        b.update_property(&[gtk::accessible::Property::Label(&format!(
+                            "Confirmar a exclusão do perfil {name}"
+                        ))]);
                     }
                 });
             }
@@ -853,6 +895,7 @@ impl Ui {
             .iter()
             .map(|c| c.id.clone())
             .collect();
+        *self.last_state.borrow_mut() = Some(state.clone());
         self.profile.set_label(&active_profile_label(state));
         *self.active_profile.borrow_mut() = state.profile.id.clone();
         self.refresh_profile_menu(state);
@@ -1262,6 +1305,8 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
     scale.set_hexpand(true);
     scale.set_draw_value(false);
     scale.add_mark(0.0, gtk::PositionType::Bottom, None);
+    scale.adjustment().set_step_increment(0.05);
+    scale.adjustment().set_page_increment(0.25);
     scale.update_property(&[gtk::accessible::Property::Label(
         "ChatMix: equilíbrio entre os dois canais na escuta",
     )]);
@@ -1305,6 +1350,7 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
         .placeholder_text("Nome do canal")
         .max_length(64)
         .build();
+    name_entry.update_property(&[gtk::accessible::Property::Label("Nome do novo canal")]);
     let add_ok = gtk::Button::with_label("Criar canal");
     add_box.append(&name_entry);
     add_box.append(&add_ok);
@@ -1342,6 +1388,8 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
         profile_sig: RefCell::new(String::new()),
         active_profile,
         emit_ui: ctx.emit.clone(),
+        profile_pop: profile_pop.clone(),
+        last_state: RefCell::new(None),
         row,
         add_button,
         chatmix: ChatMixBar {
@@ -1358,6 +1406,19 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
         transient: RefCell::new(None),
     });
     UI.with(|u| *u.borrow_mut() = Some(ui.clone()));
+    {
+        // fechar o menu de perfis desfaz uma confirmação de exclusão pendente: refaz as linhas a partir do último retrato
+        let weak = Rc::downgrade(&ui);
+        profile_pop.connect_closed(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.profile_sig.borrow_mut().clear();
+                let last = ui.last_state.borrow().clone();
+                if let Some(state) = last {
+                    ui.refresh_profile_menu(&state);
+                }
+            }
+        });
+    }
 
     if opts.demo {
         ui.apply_state(&demo_state(), None);
@@ -1393,6 +1454,17 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
     }
 
     window.present();
+    // recurso de desenvolvimento: `kill -USR1 <pid>` grava a janela em $IARA_UI_SHOT_PATH, sem encerrar o app
+    if let Some(path) = std::env::var_os("IARA_UI_SHOT_PATH").map(PathBuf::from) {
+        let w = window.clone();
+        glib::unix_signal_add_local(10, move || {
+            match save_png(&w, &path) {
+                Ok(()) => eprintln!("captura salva em {}", path.display()),
+                Err(e) => eprintln!("falha na captura: {e}"),
+            }
+            glib::ControlFlow::Continue
+        });
+    }
     if let Some(path) = opts.screenshot.clone() {
         let (w, app) = (window.clone(), app.clone());
         let delay = std::env::var("IARA_UI_SHOT_DELAY_MS")

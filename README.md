@@ -46,4 +46,6 @@ cargo run -p iara-ui --features gtk-ui -- --demo --screenshot captura.png   # gr
 
 `iara-service --restore-default` devolve a saída padrão anterior se um serviço anterior caiu deixando o Iara como padrão do sistema.
 
+`tools/provas/20-janela-entrada-real.sh` exercita a janela com mouse e teclado reais e pela acessibilidade (precisa de `xdotool` e `python-gobject`; move o ponteiro).
+
 `tools/provas/13-ui-ao-vivo.sh` abre a janela contra um serviço de teste, muda valores por fora (`busctl`) e captura o resultado.

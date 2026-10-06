@@ -369,6 +369,34 @@ duplicar o ativo copia o estado atual, inclusive ajustes ainda não gravados.
 Limites: o menu de perfis da janela foi compilado e visto na captura do cabeçalho, mas o popover e os cliques não foram exercitados com entrada real; importar/exportar
 perfis e restaurar revisões ainda não têm comando no IPC nem interface.
 
+## Prova 20 — a janela com entrada real
+
+Script: `tools/provas/20-janela-entrada-real.sh` (auxiliar de acessibilidade em `tools/janela/at.py`). Sobe um serviço isolado e a janela via XWayland
+(`GDK_BACKEND=x11`), e a dirige com **mouse e teclado reais** (`xdotool`) e pela **acessibilidade** (AT-SPI, o caminho de um leitor de tela). Cada verificação lê o efeito
+**no serviço**, não a aparência. A partir de um ambiente limpo: **25 verificações, 25 ok**.
+
+Defeitos que só apareceram com entrada real (todos corrigidos):
+
+| Defeito | Efeito | Correção |
+| --- | --- | --- |
+| O botão da etiqueta reivindicava o gesto ao ser pressionado | **arrastar e soltar era impossível** | `DragSource` na fase de captura (o clique simples segue abrindo o menu) |
+| O realce "soltar aqui" não saía depois da soltura (dois handlers de `drop`; o primeiro devolve `true`) | coluna ficava marcada | o realce sai dentro do próprio handler |
+| Passos de teclado dos sliders de 0,06 dB | ajuste fino por teclado inviável | 1 dB por seta, 6 dB por Page |
+| Todos os sliders e botões de mute com nomes acessíveis repetidos ("Volume — ESCUTA") | leitor de tela não distingue os canais | nomes com o canal ("GAME — volume da escuta", "MIC — volume para aplicativos") |
+| Campos de texto sem nome acessível | leitor de tela os anuncia vazios | nomes ("Nome do novo canal", "Novo nome do canal") |
+| O menu de perfis não fechava ao escolher um perfil | clique seguinte no cabeçalho o fechava | fecha ao escolher |
+| **Confirmação de exclusão sobrevivia a fechar e reabrir o menu**; nome acessível não dizia o perfil | um clique casual depois excluía sem nova confirmação | confirmação desfeita ao fechar o menu; nomes "Excluir o perfil X" / "Confirmar a exclusão do perfil X"; estado armado por ícone, cor e nome |
+| O interruptor "Mover só nesta sessão" não mostrava que estava ligado | usuário sem como saber o modo | estilo de ligado no cabeçalho |
+
+Confirmado funcionando: arrastar a etiqueta entre colunas salva a regra; com "só nesta sessão" ligado vale só até o app parar e a regra salva não muda; clique simples abre o menu
+"Mover para…"; "Reaplicar regra do perfil"; arrastar slider, mute, participação, mute global do MIC, ChatMix (arrasto e "Centro"); criar, trocar e excluir perfil (duas etapas, lixeira);
+criar, renomear e remover canal (duas etapas).
+
+Cuidados e limites do método: o `xdotool` move o **ponteiro real** do usuário; as posições da janela mudam entre execuções, então o ponteiro só clica depois de confirmar que
+está sobre a janela do Iara (uma versão inicial do roteiro, sem essa trava, deu cliques em coordenadas erradas quando a janela se moveu). A janela foi exercitada via **XWayland**, não no
+backend Wayland nativo; popovers foram acionados pela acessibilidade (sem posições no backend X11); Tab/Enter puro para chegar a uma etiqueta e abri-la, e um leitor de tela real (Orca),
+não foram testados.
+
 ### O que isto NÃO prova
 
 - Medições longas (horas), CPU com medidores de nível ativos e com efeitos; o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.
