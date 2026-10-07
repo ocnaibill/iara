@@ -87,6 +87,14 @@ cp "$SHOT" "$TMP/../iara-medidores-clipe.png" 2>/dev/null
 sleep 3; snap
 check "clipe apaga depois de 2 s" "[ \"\$(val ch:media:personal 4)\" = false ]" "$(val ch:media:personal 4)"
 
+echo "# canal criado e removido com a janela aberta: o tap acompanha"
+bc AddChannel ss musica Musica >/dev/null; sleep 3
+check "nove taps com o canal novo" "[ \"\$(taps)\" = 9 ]" "$(taps)"
+tone iara.ch.musica half 2; snap; stop_tone
+check "o canal novo mostra o seno na escuta" "near \"\$(val ch:musica:personal 2)\" $exp 0.02" "$(val ch:musica:personal 2)"
+bc RemoveChannel ss musica "" >/dev/null; sleep 8
+check "de volta a oito taps depois de remover" "[ \"\$(taps)\" = 8 ]" "$(taps)"
+
 echo "# janela minimizada: medidores desligam no serviço; ao voltar, religam"
 WID=$(xdotool search --onlyvisible --pid "$UIPID" --name "^Iara$" | head -1)
 xdotool windowminimize "$WID"; sleep 2

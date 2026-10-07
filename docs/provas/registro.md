@@ -441,7 +441,7 @@ grafo privado; (2) o roteiro 20 tinha `pkill -x iara-ui`, que mataria também a 
 
 Script: `tools/provas/23-medidores-janela.sh`. Serviço + janela contra um **PipeWire, um D-Bus e uma tela (Xvfb + openbox) privados**: a janela de teste não aparece na tela de ninguém, o ponteiro real não é tocado e
 não depende de a sessão estar desbloqueada. A janela tem um gancho de desenvolvimento (`kill -USR1`, com `IARA_UI_SHOT_PATH`) que grava o PNG e um `.meters` com o que cada barra mostra; as verificações leem o `.meters`
-(o PNG é evidência visual, conferida a olho). **27 verificações, 27 ok** em 4 rodadas seguidas.
+(o PNG é evidência visual, conferida a olho). **30 verificações, 30 ok** (27/27 em 4 rodadas seguidas antes de acrescentar a criação e remoção de canal; 30/30 na rodada seguinte).
 
 | Verificação | Medido |
 | --- | --- |
@@ -452,6 +452,7 @@ não depende de a sessão estar desbloqueada. A janela tem um gancho de desenvol
 | mute da escuta | barra da escuta em 0; a da transmissão segue |
 | som para | nível e pico chegam ao piso em 4 s |
 | seno de amplitude 1,2 (+1,6 dBFS) em MEDIA | clipe aceso, barra no topo; apaga depois de 2 s |
+| canal criado e removido com a janela aberta | 9 taps; o canal novo mostra o seno (≈ −6,02) na escuta; 8 taps depois de remover |
 | **serviço reiniciado com a janela aberta** | 8 taps de volta e níveis voltam a chegar |
 
 Defeitos achados (corrigidos): (1) **a janela não percebia o serviço reiniciar** (só esperava o sinal `Changed`, que um processo morto não emite), então o pedido de medidores nunca era refeito; agora a janela acompanha o dono do
