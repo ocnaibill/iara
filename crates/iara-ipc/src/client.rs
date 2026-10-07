@@ -258,6 +258,21 @@ impl Client {
         Ok(LevelsSubscription { rx })
     }
 
+    /// Avisa quando o serviço entra ou sai do barramento (dono do nome muda). Sem isso, um serviço que reinicia passa
+    /// despercebido: nenhum `Changed` chega do processo que morreu.
+    pub fn watch_owner(&self) -> Result<OwnerWatch, ClientError> {
+        let changes = self.proxy.receive_owner_changed()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for owner in changes {
+                if tx.send(owner.is_some()).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(OwnerWatch { rx })
+    }
+
     /// Assina o sinal `Changed`. Crie a assinatura ANTES de agir se não puder perder avisos; ela vive até o fim do processo
     /// (uma por aplicação basta: guarde-a e releia o estado a cada aviso).
     pub fn subscribe(&self) -> Result<Subscription, ClientError> {
@@ -287,6 +302,11 @@ impl Subscription {
         self.rx.recv_timeout(timeout).ok()
     }
 
+    /// Como `wait`, mas distingue o prazo esgotado do fim da assinatura (conexão encerrada).
+    pub fn next(&self, timeout: Duration) -> Result<u64, std::sync::mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
     /// Descarta o acumulado e devolve a versão mais recente (coalescendo rajadas), se houver.
     pub fn latest(&self) -> Option<u64> {
         self.rx.try_iter().last()
@@ -307,5 +327,17 @@ impl LevelsSubscription {
     /// Descarta o acumulado e devolve só o pacote mais recente, se houver (a interface desenha o mais novo).
     pub fn latest(&self) -> Option<Vec<(String, f64)>> {
         self.rx.try_iter().last()
+    }
+}
+
+/// Entradas e saídas do serviço no barramento: `true` = há um dono do nome, `false` = o serviço saiu.
+pub struct OwnerWatch {
+    rx: std::sync::mpsc::Receiver<bool>,
+}
+
+impl OwnerWatch {
+    /// Próxima mudança de dono (`true` = há dono), ou o motivo de não haver: prazo esgotado ou assinatura encerrada.
+    pub fn next(&self, timeout: Duration) -> Result<bool, std::sync::mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
     }
 }

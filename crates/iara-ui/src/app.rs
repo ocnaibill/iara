@@ -2,6 +2,7 @@
 //! Os valores vêm de `model` (testado sem GTK); aqui ficam widgets, estilo e a ligação com o backend.
 
 use crate::backend::{Backend, OnUpdate, Update};
+use crate::meters::{MeterBoard, MeterView};
 use crate::model::{
     active_profile_label, chatmix_view, chips_by_column, columns, device_choices, move_app,
     position_to_gain, profile_rows, reapply_rule, slug, status_lines, AppChip, ColumnKind,
@@ -10,12 +11,13 @@ use crate::model::{
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 use iara_core::edit::{EditCommand, MicSend, SendKind};
+use iara_core::meter::MeterKey;
 use iara_core::Gain;
 use iara_ipc::{AppEntry, AppSource, AppState, DefaultOutput, ProfileOp, State};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Id do aplicativo GTK. Não pode ser o nome do serviço (`dev.iara.Mixer`): o GApplication registra o id no
 /// barramento de sessão e colidiria com o dono do nome.
@@ -31,11 +33,16 @@ window.iara { background: #0e1b22; color: #d8e6ea; }
 .iara .strip-caption { color: #7e98a1; font-size: 9.5px; letter-spacing: 0.4px; }
 .iara .value { font-feature-settings: 'tnum'; font-size: 12px; }
 .iara .note { color: #f2b35e; font-size: 10px; }
-.iara scale trough { background: #1f3a45; min-width: 6px; min-height: 6px; border-radius: 6px; }
+.iara scale trough { background: transparent; min-width: 6px; min-height: 6px; border-radius: 6px; }
+.iara scale.vstrip trough { min-width: 14px; }
 .iara scale highlight { background: #5ad1c5; border-radius: 6px; border: none; margin: 0; min-width: 0; min-height: 0; }
+.iara scale.vstrip highlight { background: rgba(90, 209, 197, 0.30); border: 1px solid #5ad1c5; }
 .iara scale.tx highlight { background: #f2b35e; }
+.iara scale.vstrip.tx highlight { background: rgba(242, 179, 94, 0.30); border: 1px solid #f2b35e; }
+.iara scale.hstrip trough { background: #1f3a45; }
 .iara scale slider { background: #e8f2f4; min-width: 20px; min-height: 12px; margin: 0; border-radius: 4px; border: none; box-shadow: 0 1px 3px rgba(0,0,0,.5); }
 .iara .off scale highlight { background: #3a5560; }
+.iara .off scale.vstrip highlight { background: rgba(126, 152, 161, 0.25); border: 1px solid #3a5560; }
 .iara .off .value { color: #7e98a1; }
 .iara .head { min-height: 34px; }
 .iara button.flat-btn { background: #1b323c; border: 1px solid #25444f; border-radius: 8px; color: #d8e6ea; }
@@ -244,6 +251,10 @@ struct Strip {
     note: gtk::Label,
     mute: gtk::ToggleButton,
     dragging: Rc<Cell<bool>>,
+    /// Qual medidor alimenta a barra deste slider e o que ela desenha agora.
+    meter_key: MeterKey,
+    meter_view: Rc<Cell<MeterView>>,
+    meter_area: gtk::DrawingArea,
 }
 
 impl Strip {
@@ -300,6 +311,7 @@ fn build_strip(
     caption: &str,
     icon: &str,
     transmission: bool,
+    meter_key: MeterKey,
     updating: &Rc<Cell<bool>>,
     h: Handlers,
 ) -> Strip {
@@ -322,6 +334,7 @@ fn build_strip(
     scale.set_draw_value(false);
     scale.set_vexpand(true);
     scale.set_size_request(30, 200);
+    scale.add_css_class("vstrip");
     if transmission {
         scale.add_css_class("tx");
     }
@@ -348,7 +361,15 @@ fn build_strip(
         press.connect_stopped(move |_| d.set(false));
     }
     scale.add_controller(press);
-    root.append(&scale);
+    // medidor ao vivo: a barra é desenhada ATRÁS do slider (o fundo da calha é dela), então o puxador e o preenchimento do
+    // ganho ficam por cima e continuam recebendo o mouse e o teclado
+    let meter_view = Rc::new(Cell::new(MeterView::default()));
+    let meter_area = build_meter_area(&scale, &meter_view);
+    let stack = gtk::Overlay::new();
+    stack.set_child(Some(&meter_area));
+    stack.add_overlay(&scale);
+    stack.set_measure_overlay(&scale, true);
+    root.append(&stack);
 
     let value = label("0,0 dB", "value");
     let note = label("", "note");
@@ -402,6 +423,128 @@ fn build_strip(
         note,
         mute,
         dragging,
+        meter_key,
+        meter_view,
+        meter_area,
+    }
+}
+
+/// Onde a barra vai, em coordenadas da área de desenho: centro horizontal e extensão vertical da calha do slider, e o trecho
+/// do eixo que o puxador percorre (a barra usa o mesmo eixo, então um sinal de −6 dBFS chega à altura de um slider posto
+/// em −6 dB). O slider fica deslocado dentro da área (margens do tema), por isso o ponto de origem é consultado.
+#[derive(Clone, Copy)]
+struct MeterGeometry {
+    center_x: f64,
+    well_y: f64,
+    well_h: f64,
+    top: f64,
+    bottom: f64,
+}
+
+fn meter_geometry(scale: &gtk::Scale, area: &gtk::DrawingArea) -> MeterGeometry {
+    let (ox, oy) = scale
+        .compute_point(area, &gtk::graphene::Point::new(0.0, 0.0))
+        .map_or((0.0, 0.0), |p| (f64::from(p.x()), f64::from(p.y())));
+    let rect = scale.range_rect();
+    let (start, end) = scale.slider_range();
+    let knob = f64::from((end - start).max(0));
+    let well_y = oy + f64::from(rect.y());
+    let well_h = f64::from(rect.height());
+    let top = well_y + knob / 2.0;
+    let bottom = (well_y + well_h - knob / 2.0).max(top);
+    MeterGeometry {
+        center_x: ox + f64::from(rect.x()) + f64::from(rect.width()) / 2.0,
+        well_y,
+        well_h,
+        top,
+        bottom,
+    }
+}
+
+fn build_meter_area(scale: &gtk::Scale, view: &Rc<Cell<MeterView>>) -> gtk::DrawingArea {
+    // puramente decorativo para tecnologias assistivas: o valor e o estado já estão nos controles
+    let area = gtk::DrawingArea::builder()
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .vexpand(true)
+        .build();
+    area.set_size_request(30, 200);
+    area.set_can_target(false);
+    let (scale, view) = (scale.clone(), view.clone());
+    area.set_draw_func(move |area, cr, _, _| {
+        draw_meter(cr, &meter_geometry(&scale, area), view.get())
+    });
+    area
+}
+
+/// Desenha o poço, o nível (degradê fixo: verde → amarelo → vermelho), o pico mantido e o indicador de clipe.
+/// O clipe e o pico têm forma própria (bloco no topo, traço claro): o estado não depende só da cor.
+fn draw_meter(cr: &gtk::cairo::Context, g: &MeterGeometry, v: MeterView) {
+    let MeterGeometry {
+        center_x,
+        well_y,
+        well_h,
+        top,
+        bottom,
+    } = *g;
+    let bar_w = 10.0;
+    let x = (center_x - bar_w / 2.0).floor();
+    let rounded = |cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64| {
+        let r = r.min(w / 2.0).min(h / 2.0);
+        cr.new_sub_path();
+        cr.arc(x + w - r, y + r, r, -std::f64::consts::FRAC_PI_2, 0.0);
+        cr.arc(x + w - r, y + h - r, r, 0.0, std::f64::consts::FRAC_PI_2);
+        cr.arc(
+            x + r,
+            y + h - r,
+            r,
+            std::f64::consts::FRAC_PI_2,
+            std::f64::consts::PI,
+        );
+        cr.arc(
+            x + r,
+            y + r,
+            r,
+            std::f64::consts::PI,
+            3.0 * std::f64::consts::FRAC_PI_2,
+        );
+        cr.close_path();
+    };
+    // poço
+    cr.set_source_rgb(0.122, 0.227, 0.271);
+    rounded(cr, x, well_y, bar_w, well_h, 5.0);
+    let _ = cr.fill();
+    let span = bottom - top;
+    if span <= 0.0 {
+        return;
+    }
+    let y_of = |p: f32| bottom - span * f64::from(p.clamp(0.0, 1.0));
+    // nível: recorta no poço e preenche de baixo até a altura do nível com o degradê fixo
+    if v.level > 0.0 {
+        let _ = cr.save();
+        rounded(cr, x, well_y, bar_w, well_h, 5.0);
+        cr.clip();
+        let grad = gtk::cairo::LinearGradient::new(0.0, bottom, 0.0, top);
+        grad.add_color_stop_rgb(0.0, 0.208, 0.788, 0.561);
+        grad.add_color_stop_rgb(0.7, 0.333, 0.863, 0.494);
+        grad.add_color_stop_rgb(0.85, 0.949, 0.831, 0.369);
+        grad.add_color_stop_rgb(1.0, 0.937, 0.353, 0.373);
+        let _ = cr.set_source(&grad);
+        let y = y_of(v.level);
+        cr.rectangle(x, y, bar_w, well_y + well_h - y);
+        let _ = cr.fill();
+        let _ = cr.restore();
+    }
+    // pico mantido: traço claro de 2 px
+    if v.hold > 0.0 {
+        cr.set_source_rgb(0.91, 0.949, 0.957);
+        cr.rectangle(x, y_of(v.hold) - 1.0, bar_w, 2.0);
+        let _ = cr.fill();
+    }
+    // clipe: bloco vermelho no alto do poço
+    if v.clip {
+        cr.set_source_rgb(0.937, 0.353, 0.373);
+        rounded(cr, x, well_y, bar_w, 5.0, 2.0);
+        let _ = cr.fill();
     }
 }
 
@@ -581,6 +724,18 @@ fn manage_menu(id: &str, name: &str, others: &[(String, String)], emit: &Emit) -
     mb
 }
 
+/// Medidor que alimenta o slider de uma coluna: canal, MASTER ou MIC, escuta ou transmissão.
+fn meter_key(kind: &ColumnKind, id: &str, transmission: bool) -> MeterKey {
+    match kind {
+        ColumnKind::Channel => MeterKey::Channel {
+            id: id.to_owned(),
+            transmission,
+        },
+        ColumnKind::Master => MeterKey::Master { transmission },
+        ColumnKind::Mic => MeterKey::Mic { transmission },
+    }
+}
+
 fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &AppsCtx) -> Column {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
     root.add_css_class("column");
@@ -627,6 +782,7 @@ fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &Ap
         }
         root.append(&gm);
         let input = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.001);
+        input.add_css_class("hstrip");
         input.set_draw_value(false);
         input.update_property(&[gtk::accessible::Property::Label("MIC — ganho de entrada")]);
         set_gain_steps(&input);
@@ -671,6 +827,7 @@ fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &Ap
             "APLICATIVOS",
             "audio-input-microphone-symbolic",
             true,
+            MeterKey::MicApps,
             updating,
             apps_handlers,
         );
@@ -690,6 +847,7 @@ fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &Ap
         "ESCUTA",
         "audio-headphones-symbolic",
         false,
+        meter_key(&v.kind, &v.id, false),
         updating,
         kind_handlers(&v.kind, &v.id, SendKind::Personal, emit),
     );
@@ -698,6 +856,7 @@ fn build_column(v: &ColumnView, emit: &Emit, updating: &Rc<Cell<bool>>, ctx: &Ap
         "TRANSMISSÃO",
         "network-wireless-symbolic",
         true,
+        meter_key(&v.kind, &v.id, true),
         updating,
         kind_handlers(&v.kind, &v.id, SendKind::Transmission, emit),
     );
@@ -914,9 +1073,101 @@ struct Ui {
     emit: Emit,
     ctx: AppsCtx,
     transient: RefCell<Option<String>>,
+    /// Estado de exibição dos medidores ao vivo e o relógio que os deixa decair quando não chega notícia.
+    meters: RefCell<MeterBoard>,
+    meter_timer: Cell<bool>,
+    /// A janela está visível (não minimizada)? Só então os medidores ficam ligados no serviço.
+    meters_wanted: Cell<bool>,
+    /// Ainda não houve retrato desta conexão com o serviço: o pedido de medidores precisa ser refeito quando ele chegar.
+    needs_meter_request: Cell<bool>,
 }
 
 impl Ui {
+    /// Leva o que o `MeterBoard` sabe para as barras (só redesenha as que mudaram).
+    fn paint_meters(&self) {
+        let now = Instant::now();
+        let board = self.meters.borrow();
+        for c in self.cols.borrow().iter() {
+            for s in [&c.personal, &c.transmission]
+                .into_iter()
+                .chain(c.mic.iter().map(|m| &m.apps))
+            {
+                let v = board.view(&s.meter_key, now);
+                if s.meter_view.get() != v {
+                    s.meter_view.set(v);
+                    s.meter_area.queue_draw();
+                }
+            }
+        }
+    }
+
+    fn feed_levels(self: &Rc<Self>, levels: &[(String, f64)]) {
+        self.meters.borrow_mut().feed(levels, Instant::now());
+        self.paint_meters();
+        self.keep_meters_decaying();
+    }
+
+    /// Sem pacotes novos (silêncio: o serviço para de enviar) as barras ainda precisam cair e soltar o pico: um relógio
+    /// de 50 ms roda só enquanto houver algo para animar e se desliga sozinho.
+    fn keep_meters_decaying(self: &Rc<Self>) {
+        if self.meter_timer.get() || self.meters.borrow().is_idle(Instant::now()) {
+            return;
+        }
+        self.meter_timer.set(true);
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            let Some(ui) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let now = Instant::now();
+            ui.meters.borrow_mut().tick(now);
+            ui.paint_meters();
+            if ui.meters.borrow().is_idle(now) {
+                ui.meter_timer.set(false);
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+    }
+
+    /// Recurso de desenvolvimento: o que cada barra mostra agora, em texto (`chave nível pico clipe`, posições 0..1).
+    fn dump_meters(&self) -> String {
+        let now = Instant::now();
+        let board = self.meters.borrow();
+        let mut lines = Vec::new();
+        for c in self.cols.borrow().iter() {
+            for s in [&c.personal, &c.transmission]
+                .into_iter()
+                .chain(c.mic.iter().map(|m| &m.apps))
+            {
+                let v = board.view(&s.meter_key, now);
+                lines.push(format!(
+                    "{} {:.3} {:.3} {}",
+                    s.meter_key.encode(),
+                    v.level,
+                    v.hold,
+                    v.clip
+                ));
+            }
+        }
+        lines.join("\n") + "\n"
+    }
+
+    /// Serviço sumiu ou medidores desligados: as barras voltam ao piso na hora.
+    fn reset_meters(&self) {
+        self.meters.borrow_mut().clear();
+        self.paint_meters();
+    }
+
+    fn request_meters(&self, on: bool) {
+        self.meters_wanted.set(on);
+        (self.emit_ui)(UiCommand::Meters(on));
+        if !on {
+            self.reset_meters();
+        }
+    }
+
     fn render_banner(&self, state: Option<&State>, unavailable: Option<&str>) {
         while let Some(c) = self.banner.first_child() {
             self.banner.remove(&c);
@@ -1106,6 +1357,7 @@ impl Ui {
         self.render_banner(Some(state), unavailable);
         self.row
             .set_sensitive(state.connected || unavailable.is_none());
+        self.paint_meters();
         self.updating.set(false);
     }
 }
@@ -1125,6 +1377,27 @@ fn on_main(f: impl FnOnce(&Rc<Ui>) + Send + 'static) {
 }
 
 /// Retrato de demonstração para `--demo`: mostra a interface sem serviço nem PipeWire.
+/// Níveis de exemplo para o modo `--demo`: um mix em andamento, com o MASTER perto do topo.
+fn demo_levels() -> Vec<(String, f64)> {
+    [
+        ("ch:game:personal", 0.42),
+        ("ch:game:transmission", 0.42),
+        ("ch:chat:personal", 0.16),
+        ("ch:chat:transmission", 0.16),
+        ("ch:media:personal", 0.30),
+        ("ch:media:transmission", 0.30),
+        ("ch:aux:personal", 0.0),
+        ("master:personal", 0.62),
+        ("master:transmission", 0.40),
+        ("mic:personal", 0.0),
+        ("mic:transmission", 0.12),
+        ("mic-apps", 0.10),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect()
+}
+
 pub fn demo_state() -> State {
     use iara_core::edit::{apply, EditCommand as E};
     let mut p = iara_core::initial_profile();
@@ -1285,13 +1558,17 @@ pub fn demo_state() -> State {
     }
 }
 
-fn save_png(window: &gtk::ApplicationWindow, path: &std::path::Path) -> Result<(), String> {
-    save_widget_png(window.upcast_ref::<gtk::Widget>(), path)
-}
-
 /// Renderiza qualquer widget com superfície própria (janela, popover) em PNG, sem ferramenta de captura de tela.
 fn save_widget_png(widget: &gtk::Widget, path: &std::path::Path) -> Result<(), String> {
     let paintable = gtk::WidgetPaintable::new(Some(widget));
+    paintable_to_png(widget, &paintable, path)
+}
+
+fn paintable_to_png(
+    widget: &gtk::Widget,
+    paintable: &gtk::WidgetPaintable,
+    path: &std::path::Path,
+) -> Result<(), String> {
     let (w, h) = (widget.width() as f64, widget.height() as f64);
     let snapshot = gtk::Snapshot::new();
     paintable.snapshot(snapshot.upcast_ref::<gdk::Snapshot>(), w, h);
@@ -1302,6 +1579,32 @@ fn save_widget_png(widget: &gtk::Widget, path: &std::path::Path) -> Result<(), S
         .ok_or("sem renderer")?;
     let texture = renderer.render_texture(&node, None);
     texture.save_to_png(path).map_err(|e| e.to_string())
+}
+
+/// Grava a janela em PNG. Um `WidgetPaintable` recém-criado só tem conteúdo depois de o widget ser desenhado num quadro
+/// seguinte: cria o paintable, força um redesenho e só então tira o retrato (com algumas tentativas).
+fn shoot(window: &gtk::ApplicationWindow, path: PathBuf, tries: u32) {
+    let paintable = gtk::WidgetPaintable::new(Some(window));
+    window.queue_draw();
+    shoot_with(window.clone(), paintable, path, tries);
+}
+
+fn shoot_with(
+    window: gtk::ApplicationWindow,
+    paintable: gtk::WidgetPaintable,
+    path: PathBuf,
+    tries: u32,
+) {
+    glib::timeout_add_local_once(Duration::from_millis(150), move || {
+        match paintable_to_png(window.upcast_ref::<gtk::Widget>(), &paintable, &path) {
+            Ok(()) => eprintln!("captura salva em {}", path.display()),
+            Err(_) if tries > 0 => {
+                window.queue_draw();
+                shoot_with(window, paintable, path, tries - 1);
+            }
+            Err(e) => eprintln!("falha na captura: {e}"),
+        }
+    });
 }
 
 fn build_ui(app: &gtk::Application, opts: &Options) {
@@ -1492,6 +1795,7 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
     let first = label("", "strip-caption");
     let second = label("", "strip-caption");
     let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, -1.0, 1.0, 0.01);
+    scale.add_css_class("hstrip");
     scale.set_hexpand(true);
     scale.set_draw_value(false);
     scale.add_mark(0.0, gtk::PositionType::Bottom, None);
@@ -1596,6 +1900,10 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
         emit,
         ctx,
         transient: RefCell::new(None),
+        meters: RefCell::new(MeterBoard::default()),
+        meter_timer: Cell::new(false),
+        meters_wanted: Cell::new(true),
+        needs_meter_request: Cell::new(true),
     });
     UI.with(|u| *u.borrow_mut() = Some(ui.clone()));
     {
@@ -1614,6 +1922,9 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
 
     if opts.demo {
         ui.apply_state(&demo_state(), None);
+        // níveis fixos para a captura de tela e para ver o desenho sem serviço (não decaem: nenhum relógio roda)
+        ui.meters.borrow_mut().feed(&demo_levels(), Instant::now());
+        ui.paint_meters();
     } else {
         // enquanto o primeiro retrato não chega, mostra que está procurando o serviço
         ui.render_banner(None, Some("procurando…"));
@@ -1622,8 +1933,15 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
                 Update::State(st) => {
                     *ui.transient.borrow_mut() = None;
                     ui.apply_state(&st, None);
+                    // o serviço (re)apareceu: o pedido de medidores morre com a conexão antiga, então se refaz
+                    if ui.needs_meter_request.replace(false) && ui.meters_wanted.get() {
+                        (ui.emit_ui)(UiCommand::Meters(true));
+                    }
                 }
+                Update::Levels(levels) => ui.feed_levels(&levels),
                 Update::Unavailable(m) => {
+                    ui.needs_meter_request.set(true);
+                    ui.reset_meters();
                     ui.row.set_sensitive(false);
                     ui.render_banner(None, Some(&m));
                 }
@@ -1643,6 +1961,32 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
             });
         });
         *backend.borrow_mut() = Some(Backend::spawn(opts.bus_name.clone(), cb));
+        // oculta ou minimizada, a janela não precisa de medidores: desliga no serviço e religa ao voltar. Cobre as duas formas:
+        // X11 desmapeia a janela ao minimizar; no Wayland ela continua mapeada e só muda o estado do toplevel.
+        let set_visible = {
+            let weak = Rc::downgrade(&ui);
+            Rc::new(move |visible: bool| {
+                if let Some(ui) = weak.upgrade() {
+                    if visible != ui.meters_wanted.get() {
+                        ui.request_meters(visible);
+                    }
+                }
+            })
+        };
+        {
+            let (on, off) = (set_visible.clone(), set_visible.clone());
+            window.connect_map(move |_| on(true));
+            window.connect_unmap(move |_| off(false));
+        }
+        window.connect_realize(move |w| {
+            let Some(top) = w.surface().and_then(|s| s.downcast::<gdk::Toplevel>().ok()) else {
+                return;
+            };
+            let set_visible = set_visible.clone();
+            top.connect_state_notify(move |t| {
+                set_visible(!t.state().contains(gdk::ToplevelState::MINIMIZED));
+            });
+        });
     }
 
     window.present();
@@ -1651,10 +1995,12 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
         let w = window.clone();
         let path_main = path.clone();
         glib::unix_signal_add_local(10, move || {
-            match save_png(&w, &path_main) {
-                Ok(()) => eprintln!("captura salva em {}", path_main.display()),
-                Err(e) => eprintln!("falha na captura: {e}"),
-            }
+            UI.with(|u| {
+                if let Some(ui) = u.borrow().as_ref() {
+                    let _ = std::fs::write(path_main.with_extension("meters"), ui.dump_meters());
+                }
+            });
+            shoot(&w, path_main.clone(), 8);
             glib::ControlFlow::Continue
         });
         // `kill -USR2`: grava os popovers abertos (menus de perfis e de dispositivos) ao lado, com sufixo
@@ -1685,17 +2031,24 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
             .and_then(|v| v.parse().ok())
             .unwrap_or(900);
         glib::timeout_add_local_once(Duration::from_millis(delay), move || {
-            match save_png(&w, &path) {
-                Ok(()) => eprintln!("captura salva em {}", path.display()),
-                Err(e) => eprintln!("falha na captura: {e}"),
-            }
-            app.quit();
+            shoot(&w, path, 8);
+            // dá tempo das tentativas (até 8 × 150 ms) antes de sair
+            glib::timeout_add_local_once(Duration::from_millis(2000), move || app.quit());
         });
     }
 }
 
 pub fn run(opts: Options) -> glib::ExitCode {
-    let app = gtk::Application::builder().application_id(APP_ID).build();
+    // o modo de demonstração (e a captura) nunca reativa uma janela real já aberta: é sempre uma instância à parte
+    let flags = if opts.demo || opts.screenshot.is_some() {
+        gtk::gio::ApplicationFlags::NON_UNIQUE
+    } else {
+        gtk::gio::ApplicationFlags::default()
+    };
+    let app = gtk::Application::builder()
+        .application_id(APP_ID)
+        .flags(flags)
+        .build();
     app.connect_activate(move |app| build_ui(app, &opts));
     // os argumentos próprios (--demo etc.) já foram lidos; não repassá-los ao GTK
     app.run_with_args::<&str>(&[])

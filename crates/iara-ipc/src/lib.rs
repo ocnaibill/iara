@@ -11,7 +11,7 @@
 mod client;
 mod server;
 
-pub use client::{Client, ClientError, LevelsSubscription, Subscription};
+pub use client::{Client, ClientError, LevelsSubscription, OwnerWatch, Subscription};
 pub use server::{serve, Server};
 
 use serde::{Deserialize, Serialize};

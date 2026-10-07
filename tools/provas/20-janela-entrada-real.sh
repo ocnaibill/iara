@@ -13,7 +13,12 @@ for t in xdotool xwininfo sox pw-play busctl; do command -v $t >/dev/null || { e
 (cd "$ROOT" && cargo build -q -p iara-service -p iara-ui --features gtk-ui) || exit 1
 AT="/usr/bin/python3 $HERE/../janela/at.py"
 TMP=$(mktemp -d); PIDS=()
-cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; pkill -x iara-ui 2>/dev/null
+# O app é de instância única e o roteiro mexe no ponteiro real: com uma janela ou serviço do Iara já abertos ele atuaria nelas.
+if pgrep -x iara-ui >/dev/null || pgrep -x iara-service >/dev/null; then
+  echo "feche a janela e o serviço do Iara antes de rodar este roteiro (ele os confundiria com os de teste)"; exit 2
+fi
+UIPID=""
+cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; [ -n "$UIPID" ] && kill "$UIPID" 2>/dev/null
   for id in $(pw-dump | python3 -c "
 import json,sys
 for o in json.load(sys.stdin):
@@ -44,7 +49,7 @@ for i in $(seq 1 100); do busctl --user status "$IARA_BUS_NAME" >/dev/null 2>&1 
 sox -n -r 48000 -c 2 -b 32 -e floating-point "$TMP/t.wav" synth 600 sine 440 vol 0.02
 for n in a b; do pw-play -P "{ node.name=IaraTeste$n application.name=IaraTeste$n application.process.binary=iarateste$n media.name=f$n }" "$TMP/t.wav" & PIDS+=($!); done
 sleep 2
-start_ui() { pkill -x iara-ui 2>/dev/null; sleep 1; GDK_BACKEND=x11 "$ROOT/target/debug/iara-ui" > "$TMP/ui.log" 2>&1 & sleep 3.5; }
+start_ui() { [ -n "$UIPID" ] && kill "$UIPID" 2>/dev/null; sleep 1; GDK_BACKEND=x11 "$ROOT/target/debug/iara-ui" > "$TMP/ui.log" 2>&1 & UIPID=$!; sleep 3.5; }
 win() { xdotool search --name "^Iara$" | head -1; }
 origin() { local g; g=$(xdotool getwindowgeometry "$(win)" | awk '/Position/{print $2}'); OX=$(( ${g%%,*} + 14 )); OY=$(( ${g##*,} + 14 )); }
 over_ui() { local w; w=$(xdotool getmouselocation --shell | awk -F= '/WINDOW/{print $2}'); [ "$w" = "$(win)" ] || xwininfo -id "$w" -tree 2>/dev/null | grep -q "Parent window id: $(printf '0x%x' "$(win)")"; }

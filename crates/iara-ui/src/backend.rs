@@ -5,7 +5,7 @@
 //! As atualizações chegam por `on_update`, chamado nessas threads: quem usa deve levá-las à thread da interface.
 
 use crate::model::{coalesce_ui, UiCommand};
-use iara_ipc::{Client, ClientError, State, Subscription};
+use iara_ipc::{Client, ClientError, OwnerWatch, State, Subscription};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -16,6 +16,8 @@ pub enum Update {
     Unavailable(String),
     /// O serviço recusou um comando.
     Rejected(String),
+    /// Níveis ao vivo por slider (chave em texto, pico linear); só chegam enquanto os medidores estão ligados.
+    Levels(Vec<(String, f64)>),
 }
 
 pub type OnUpdate = Arc<dyn Fn(Update) + Send + Sync>;
@@ -48,13 +50,23 @@ fn watch(name: &str, on_update: &OnUpdate) {
     loop {
         let session = Client::connect(name).and_then(|c| {
             let sub = c.subscribe()?;
+            let owner = c.watch_owner()?;
             let st = c.state()?;
-            Ok((c, sub, st))
+            Ok((c, sub, owner, st))
         });
         match session {
-            Ok((client, sub, first)) => {
+            Ok((client, sub, owner, first)) => {
+                // os níveis têm assinatura própria; o pedido de medidores sai pela conexão dos comandos (ver `commands`)
+                if let Ok(levels) = client.subscribe_levels() {
+                    let cb = on_update.clone();
+                    std::thread::spawn(move || {
+                        while let Some(l) = levels.wait(LONG_WAIT) {
+                            cb(Update::Levels(l));
+                        }
+                    });
+                }
                 on_update(Update::State(Box::new(first)));
-                if !follow(&client, &sub, on_update) {
+                if !follow(&client, sub, owner, on_update) {
                     on_update(Update::Unavailable("o serviço saiu".into()));
                 }
             }
@@ -64,12 +76,54 @@ fn watch(name: &str, on_update: &OnUpdate) {
     }
 }
 
-/// Relê o retrato a cada `Changed`. Devolve `false` quando o serviço some.
-fn follow(client: &Client, sub: &Subscription, on_update: &OnUpdate) -> bool {
+enum Wake {
+    Changed,
+    /// O serviço saiu do barramento.
+    Gone,
+}
+
+/// Relê o retrato a cada `Changed`. Devolve `false` quando o serviço some (o que se percebe pelo dono do nome no
+/// barramento: um serviço que morre não manda mais `Changed`, e um novo logo depois seria tomado por o mesmo).
+fn follow(client: &Client, sub: Subscription, owner: OwnerWatch, on_update: &OnUpdate) -> bool {
+    let (tx, rx) = mpsc::channel();
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || loop {
+            match sub.next(LONG_WAIT) {
+                Ok(_) => {
+                    if tx.send(Wake::Changed).is_err() {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                // assinatura encerrada (conexão caiu): quem espera descobre ao reler o retrato
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = tx.send(Wake::Gone);
+                    break;
+                }
+            }
+        });
+    }
+    std::thread::spawn(move || loop {
+        match owner.next(LONG_WAIT) {
+            Ok(true) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(false) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = tx.send(Wake::Gone);
+                break;
+            }
+        }
+    });
     loop {
-        sub.wait(LONG_WAIT);
+        match rx.recv_timeout(LONG_WAIT) {
+            Ok(Wake::Gone) | Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            Ok(Wake::Changed) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
         // coalesce rajadas: um único relido cobre todos os avisos acumulados
-        let _ = sub.latest();
+        while let Ok(w) = rx.try_recv() {
+            if matches!(w, Wake::Gone) {
+                return false;
+            }
+        }
         match client.state() {
             Ok(st) => on_update(Update::State(Box::new(st))),
             Err(ClientError::Unavailable(_)) => return false,
@@ -96,6 +150,7 @@ fn commands(name: &str, rx: mpsc::Receiver<UiCommand>, on_update: &OnUpdate) {
                 UiCommand::Session { key, choice } => c.session_choice(key, choice),
                 UiCommand::Deactivate => c.deactivate().map(|()| 0),
                 UiCommand::Profile(op) => c.profile_op(op).map(|_| 0),
+                UiCommand::Meters(on) => c.set_meters(*on).map(|()| 0),
             };
             match result {
                 Ok(_) => {}

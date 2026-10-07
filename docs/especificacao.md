@@ -198,6 +198,8 @@ erro D-Bus com o motivo e não altera nada. O sinal `Changed(serial)` avisa que 
 (versão, perfil em TOML no mesmo schema do disco, conectado ao áudio, erro de gravação, dispositivos ausentes, tentativas de reconexão). Ganho em dB; `-inf` é silêncio exato.
 Não há áudio no IPC. O crate `iara-ipc` contém contrato, servidor e cliente tipado e não depende do serviço nem do PipeWire (a janela depende só dele).
 
+Medidores (9.6) têm canal próprio, fora do retrato: `SetMeters(bool)` é um pedido **por conexão** (o servidor só avisa o serviço quando o conjunto de pedidos passa de vazio a não vazio e vice-versa, e solta o pedido de uma conexão que some do barramento, observando `NameOwnerChanged`), e enquanto houver pedido o serviço emite o sinal `Levels(a(sd))` com o pico linear de cada slider (chave em texto: `ch:<id>:personal|transmission`, `master:personal|transmission`, `mic:personal|transmission`, `mic-apps`). Em silêncio sai um único pacote zerado e depois nada. O cliente assina com `subscribe_levels()` e acompanha a entrada e a saída do serviço no barramento com `watch_owner()`.
+
 ### 6.4 Comunicação e processamento
 
 Proposta inicial: D-Bus da sessão para comandos, retrato de estado e eventos. A frequência e o transporte dos medidores devem ser avaliados separadamente. A comunicação da interface não transporta os samples de áudio.
@@ -343,7 +345,7 @@ Autosave agrupa gravações após 300 ms sem novo comando e faz flush ao conclui
 - Grupo interno “Não atribuídos” recolhível no MASTER; contador/lista acessível, sem coluna adicional.
 - Nome, ícone/cor, aplicativos e indicação de regras em cada canal.
 - Sliders separados para escuta/transmissão, mutes e destinos habilitados.
-- Medidor independente da posição do slider; indicação de clipping a definir.
+- Medidor independente da posição do slider; indicação de clipping (9.6).
 - Acesso às configurações/efeitos do canal sem perder o contexto do mixer.
 - Perfil, dispositivo de escuta e microfone visíveis na região superior.
 - Estados explícitos: ativo, sem aplicativo, dispositivo ausente, aplicação pendente e erro.
@@ -370,6 +372,17 @@ Operações: trocar, criar (com os canais iniciais e os dispositivos do ativo; n
 ### 9.5 Dispositivos na janela (implementado)
 
 A engrenagem da coluna MASTER abre o popover “Dispositivos”, com a saída (fone ou alto-falantes) e o microfone que o Iara roteia, escolhidos entre os dispositivos físicos presentes; cada perfil guarda os seus (spec 8.12, sem a opção de compartilhar ainda). “Nenhuma” remove a ligação daquele lado. Um dispositivo preferido ausente continua listado e marcado, e volta sozinho quando reaparecer. A saída preferida também é adotada do padrão do sistema na primeira execução com captura da saída padrão (9.3).
+
+### 9.6 Medidores ao vivo (implementado)
+
+Pedido no teste humano: dentro de cada slider, uma barra com o áudio que realmente passa por aquele ponto, ao vivo. Como funciona:
+
+- **Medição.** O motor cria, só enquanto uma janela pede, um fluxo de captura **passivo** por barramento (um por canal, MASTER escuta, MASTER transmissão, MIC comum, MIC para aplicativos: oito no perfil inicial) que guarda o **pico de amostra** na thread de áudio (um atômico por barramento, sem alocação nem espera) e entrega os picos a cada 50 ms. Sem janela pedindo não existe nenhum tap no grafo.
+- **Nível por slider.** O serviço multiplica o pico do barramento pela amplitude efetiva do envio, lida do **mesmo plano** que gera o áudio (ganho, mute, habilitação e ChatMix): o resultado é exatamente o pico depois do envio, e mutar um envio faz a barra dele cair a zero mesmo com som no barramento. O medidor não depende da posição do slider.
+- **Desenho.** A barra é desenhada atrás do slider, no fundo da calha, no mesmo eixo do puxador (−60 dBFS embaixo, 0 dBFS em cima): um sinal de −6 dBFS chega à altura de um slider posto em −6 dB. Degradê fixo: verde até cerca de −18 dBFS, amarelo perto de −9 dBFS e vermelho em 0 dBFS (a cor depende da altura, não do tempo); **pico mantido** por 1 s como traço claro de 2 px; **clipe** (≥ 0 dBFS) como bloco vermelho no topo por 2 s. O estado não depende só da cor (traço e bloco têm forma própria). Queda de 40 dB/s e ataque instantâneo. A barra é decorativa para tecnologias assistivas (o valor e o estado já estão nos controles).
+- **Custo.** A janela pede medidores quando está visível e desliga ao minimizar ou ocultar; se o serviço reinicia ou a janela some sem avisar, o pedido é refeito ou solto sozinho. Em silêncio o serviço para de enviar e a janela deixa as barras caírem com um relógio que se desliga quando tudo chega ao piso.
+
+Limites: é pico de amostra, não true peak; o medidor do ramo MIC "ganho de entrada" (antes do ganho comum) não existe; sem tooltip com o valor em dBFS.
 
 ## 10. Requisitos de qualidade
 
@@ -502,3 +515,4 @@ Consultadas em 05/10/2026. Fundamentam capacidades existentes; os comportamentos
 - **0.10.10 — 05/10/2026:** perfis (9.4): trocar, criar, duplicar, renomear e excluir (lixeira); troca sem vazamento para a saída física, com remoção diferida de canais obsoletos e destino só quando tem portas de entrada.
 - **0.10.11 — 06/10/2026:** janela exercitada com entrada real (prova 20): arrastar e soltar corrigido (era impossível), passos de teclado de 1 dB/6 dB, nomes acessíveis por canal e confirmação de exclusão segura.
 - **0.10.12 — 06/10/2026:** escolha de fone e microfone na janela (9.5), pedida no teste humano; inventário de dispositivos físicos no motor, no serviço e no IPC.
+- **0.10.13 — 06/10/2026:** medidores ao vivo dentro dos sliders (9.6): taps passivos por barramento, nível por slider a partir do plano, sinal `Levels` e pedido por conexão no IPC (6.4.1); provas 22 e 23 em PipeWire, D-Bus e tela privados.

@@ -867,11 +867,16 @@ fn run(
     let meter_timer = {
         let st = state.clone();
         let ev = ev_tx.clone();
+        // Em silêncio só o primeiro pacote zerado sai (as interfaces deixam as barras caírem sozinhas): uma sala quieta não
+        // acorda o serviço 20 vezes por segundo.
+        let sounding = Cell::new(false);
         let t = mainloop.loop_().add_timer(move |_| {
             let peaks = st.borrow().taps.take_peaks();
-            if !peaks.is_empty() {
+            let any = peaks.values().any(|p| *p > 0.0);
+            if !peaks.is_empty() && (any || sounding.get()) {
                 ev(Event::Levels(peaks));
             }
+            sounding.set(any);
         });
         // SAFETY: o comando `SetMeters` roda num closure `'static` e precisa armar o timer, mas o timer empresta o laço.
         // O laço (`mainloop`) vive até o fim desta função e todos os clones deste `Rc` moram em variáveis declaradas depois

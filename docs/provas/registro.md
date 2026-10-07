@@ -416,6 +416,73 @@ anteriores (1 de 6 rodadas), sem causa estabelecida.
 Limites: desconectar um dispositivo de verdade com a janela aberta não foi exercitado (a ausência foi vista em captura de demonstração e provada no motor e no serviço); compartilhar os
 dispositivos entre perfis (spec 8.12) e alternativas autorizadas não existem.
 
+## Prova 22 — medidores no motor real (PipeWire privado)
+
+Script: `tools/provas/22-medidores-motor.sh`; biblioteca `tools/provas/lib_privado.sh`. O exemplo `mixer_cli` ganhou `meters on|off` e `levels`. O motor roda contra um
+**PipeWire + WirePlumber privados** (sem dispositivos físicos; `PIPEWIRE_RUNTIME_DIR` próprio), porque os nós `iara.*` de um motor de teste colidem com os de um serviço real.
+Resultado: **16 verificações, 0 falhas** (várias rodadas).
+
+| Verificação | Medido |
+| --- | --- |
+| taps antes de pedir / depois de `meters on` / depois de `off` | 0 / 8 / 0 |
+| seno 440 Hz, amplitude 0,5, tocado em `iara.ch.game` | barramento ≈ −6,02 dBFS (esperado −6,02); `chat` em silêncio |
+| ≥ 30 eventos em ~2,6 s | cerca de 20 por segundo (intervalo de 50 ms) |
+| escuta do GAME em −12 dB | slider da escuta ≈ −18,04; transmissão e barramento intactos ≈ −6,02 |
+| mute da escuta | slider da escuta em −∞; a transmissão segue |
+| ganho do MASTER escuta −6 dB | medidor do MASTER ≈ −12,04 |
+| encerrar o motor com os taps ligados | nenhum nó `iara.*` sobra |
+
+Defeitos do **método** achados no caminho: (1) minha primeira execução do roteiro rodou contra a sessão de áudio real **enquanto um serviço do usuário (teste humano) estava ativo**, criando nós
+`iara.*` com os mesmos nomes por cerca de um minuto; conferi depois que o grafo do usuário ficou intacto (links do Zen ao canal MEDIA, sem duplicatas), mas desde então todas as provas de áudio novas rodam no
+grafo privado; (2) o roteiro 20 tinha `pkill -x iara-ui`, que mataria também a janela de um usuário; passou a matar só o próprio processo; (3) uma primeira substituição minha deixou `kill "${UIPID:-0}"`, e
+`kill 0` mata o grupo de processos inteiro (derrubou o próprio roteiro); corrigido.
+
+## Prova 23 — medidores ao vivo de ponta a ponta com a janela real
+
+Script: `tools/provas/23-medidores-janela.sh`. Serviço + janela contra um **PipeWire, um D-Bus e uma tela (Xvfb + openbox) privados**: a janela de teste não aparece na tela de ninguém, o ponteiro real não é tocado e
+não depende de a sessão estar desbloqueada. A janela tem um gancho de desenvolvimento (`kill -USR1`, com `IARA_UI_SHOT_PATH`) que grava o PNG e um `.meters` com o que cada barra mostra; as verificações leem o `.meters`
+(o PNG é evidência visual, conferida a olho). **27 verificações, 27 ok** em 4 rodadas seguidas.
+
+| Verificação | Medido |
+| --- | --- |
+| serviço sozinho / janela aberta / janela minimizada (`windowminimize`, com openbox) / restaurada | 0 / 8 / 0 / 8 taps |
+| janela encerrada com `kill -9` | 0 taps em 2 s (o servidor solta o pedido da conexão que sumiu) |
+| seno 0,5 em GAME | barras de GAME (escuta e transmissão) na posição de −6,02 dBFS, pico mantido igual, sem clipe; MASTER escuta igual; CHAT em zero |
+| escuta de GAME em −12 dB | barra da escuta em −18,04; a da transmissão segue em −6,02 |
+| mute da escuta | barra da escuta em 0; a da transmissão segue |
+| som para | nível e pico chegam ao piso em 4 s |
+| seno de amplitude 1,2 (+1,6 dBFS) em MEDIA | clipe aceso, barra no topo; apaga depois de 2 s |
+| **serviço reiniciado com a janela aberta** | 8 taps de volta e níveis voltam a chegar |
+
+Defeitos achados (corrigidos): (1) **a janela não percebia o serviço reiniciar** (só esperava o sinal `Changed`, que um processo morto não emite), então o pedido de medidores nunca era refeito; agora a janela acompanha o dono do
+nome no barramento (`watch_owner`) e refaz o pedido; (2) o `xdotool search --name` devolvia uma janela auxiliar de 1×1 desmapeada (a janela de verdade é a `--onlyvisible`); (3) a captura de PNG da janela falhava
+de forma intermitente com "nada renderizado": a causa era um `WidgetPaintable` recém-criado só ter conteúdo depois de um quadro seguinte; passou a criar o paintable, forçar um redesenho e tirar o retrato 150 ms depois
+(com tentativas). Minha hipótese inicial (janela encoberta por outras) estava errada: o sintoma era o mesmo, mas a causa não. Com a sessão do usuário **bloqueada** a janela real também não renderiza, o que a tela privada contorna.
+
+Mudança de ambiente (distrobox do desenvolvedor): instalados `xorg-server-xvfb` e `openbox` com `pacman` (a autorização do usuário para usar o pacman vale para o distrobox); eles passam a ser requisito
+do roteiro 23 (o 20 segue usando a sessão real, porque exercita dispositivos físicos e o ponteiro real; ele agora se recusa a rodar com uma janela ou serviço do Iara já abertos).
+
+Limites: a janela real não foi vista no backend Wayland nativo (o teste de minimizar vale para X11, onde o estado do toplevel é `MINIMIZED` com `_NET_WM_STATE_HIDDEN`); sem leitor de tela; a barra não tem tooltip nem alternativa em texto
+com o nível; a CPU com medidores ligados em sessão longa não foi medida (o custo é um fluxo de captura passivo por barramento e 20 pacotes por segundo no barramento só quando há som).
+
+## Prova 24 — custo dos medidores ao vivo
+
+Script: `tools/provas/24-medidores-custo.sh` (`PERFIL=release` mede o binário otimizado). Mesma pilha privada da prova 23 (PipeWire sem dispositivos, D-Bus e tela Xvfb com renderização em software). Tempo de CPU ÷ tempo real
+em 15 s por situação; seno de amplitude 0,5 em GAME quando "com som". Uma única máquina (a do desenvolvedor), uma execução de cada.
+
+| Situação | serviço (release) | janela (release) | PipeWire | Levels/s | taps |
+| --- | --- | --- | --- | --- | --- |
+| (a) janela minimizada, silêncio | 0,60 % | 0,00 % | 0,47 % | 0 | 0 |
+| (b) medidores ligados, silêncio | 0,80 % | 0,00 % | 0,53 % | 0 | 8 |
+| (c) medidores ligados, com som | 0,80 % | 6,20 % | 0,40 % | 19,9 | 8 |
+| (d) minimizada, com som | 0,47 % | 0,07 % | 0,40 % | 0 | 0 |
+
+No binário de debug o serviço gasta 2,4 % (b) e 2,7 % (c): o custo dominante são os oito fluxos de captura rodando na thread de dados a cada quantum, não a conta dos níveis. xruns no PipeWire privado: 0 em todas as execuções.
+Duas otimizações vieram da medição: em silêncio o motor só envia o primeiro pacote zerado (antes eram 20 por segundo ao serviço, que recalculava o plano à toa) e o serviço também só repassa esse primeiro; o tráfego no barramento em silêncio é 0.
+
+Limites: a janela foi medida **sem GPU** (Xvfb com o renderizador de cairo, que redesenha tudo a cada pacote); com aceleração o custo deve ser menor, mas isso não foi medido. Sessão longa (horas), vazamento de memória dos taps e
+muitos canais (cada canal acrescenta um tap) não foram medidos.
+
 ### O que isto NÃO prova
 
 - Medições longas (horas), CPU com medidores de nível ativos e com efeitos; o tempo de indisponibilidade após reinício do PipeWire; clientes de captura reais (OBS/Discord) lendo a fonte virtual; saída sem hot-plug físico real (o perfil de placa foi desligado por software); Bluetooth.

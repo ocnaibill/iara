@@ -168,6 +168,9 @@ pub struct Service<B: Backend> {
     levels_notifier: Option<LevelsNotifier>,
     /// Alguma interface pediu medidores.
     meters_wanted: bool,
+    /// O último pacote de níveis enviado tinha algum som? Em silêncio só o primeiro pacote zerado sai (a janela deixa as
+    /// barras caírem sozinha), então uma sala quieta não gera tráfego no barramento.
+    levels_sounding: bool,
     overrides: Overrides,
     last_routes: Option<HashMap<String, RouteTarget>>,
     policy: Policy,
@@ -238,6 +241,7 @@ impl<B: Backend> Service<B> {
             notifier: None,
             levels_notifier: None,
             meters_wanted: false,
+            levels_sounding: false,
             overrides: Overrides::new(),
             last_routes: None,
             policy: Policy::new(capture_default, stored_default),
@@ -745,16 +749,25 @@ impl<B: Backend> Service<B> {
             Msg::Command(Command::Meters(on)) => {
                 if self.meters_wanted != on {
                     self.meters_wanted = on;
+                    self.levels_sounding = false;
                     self.sync_meters(now);
                 }
             }
             Msg::Engine(Event::Levels(peaks)) => {
+                let quiet = peaks.values().all(|p| *p <= 0.0);
+                if quiet && !self.levels_sounding {
+                    return; // silêncio contínuo: nada a calcular nem a enviar
+                }
                 if let (true, Some(n)) = (self.meters_wanted, &self.levels_notifier) {
                     let strips = iara_core::meter::strip_peaks(&self.profile, &peaks);
-                    n(strips
-                        .into_iter()
-                        .map(|(k, v)| (k.encode(), f64::from(v)))
-                        .collect());
+                    let sounding = strips.values().any(|v| *v > 0.0);
+                    if sounding || self.levels_sounding {
+                        n(strips
+                            .into_iter()
+                            .map(|(k, v)| (k.encode(), f64::from(v)))
+                            .collect());
+                    }
+                    self.levels_sounding = sounding;
                 }
             }
             Msg::Engine(Event::Disconnected) => self.drop_backend(now),
@@ -1940,6 +1953,20 @@ mod tests {
         assert!((get("ch:game:transmission").unwrap() - 0.5).abs() < 1e-6);
         assert_eq!(get("ch:chat:personal"), Some(0.0));
         assert!(get("master:personal").is_some() && get("mic-apps").is_some());
+
+        // silêncio: sai um único pacote zerado (para a janela deixar as barras caírem) e depois nada
+        let n = log.borrow().len();
+        svc.handle(game_bus(0.0), t0);
+        svc.handle(game_bus(0.0), t0);
+        svc.handle(game_bus(0.0), t0);
+        assert_eq!(
+            log.borrow().len(),
+            n + 1,
+            "um pacote zerado e então silêncio no barramento"
+        );
+        assert!(log.borrow().last().unwrap().iter().all(|(_, v)| *v == 0.0));
+        svc.handle(game_bus(0.5), t0);
+        assert_eq!(log.borrow().len(), n + 2, "som volta, pacotes voltam");
 
         svc.handle(Msg::Command(Command::Meters(false)), t0);
         assert!(world.meters.borrow().last().unwrap().is_empty());

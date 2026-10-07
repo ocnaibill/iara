@@ -204,6 +204,8 @@ pub fn coalesce(commands: Vec<EditCommand>) -> Vec<EditCommand> {
 pub fn coalesce_ui(commands: Vec<UiCommand>) -> Vec<UiCommand> {
     coalesce_by(commands, |c| match c {
         UiCommand::Edit(e) => coalesce_key(e),
+        // ligar e desligar em rajada: vale o último pedido
+        UiCommand::Meters(_) => Some("meters".to_owned()),
         UiCommand::Session { .. } | UiCommand::Deactivate | UiCommand::Profile(_) => None,
     })
 }
@@ -297,6 +299,8 @@ pub enum UiCommand {
         key: String,
         choice: SessionChoice,
     },
+    /// Liga ou desliga os medidores ao vivo (a janela pede enquanto está visível).
+    Meters(bool),
 }
 
 /// Mover um aplicativo para `channel` (`None` = Não atribuídos). Salva uma regra no perfil, ou, com `session_only`,
@@ -1020,5 +1024,16 @@ mod tests {
                 && inp[sel].label.contains("ausente")
         );
         assert_eq!(inp[sel].key.as_deref(), Some("alsa_input.sumiu"));
+    }
+
+    #[test]
+    fn meter_requests_coalesce_to_the_last_one_and_never_swallow_other_commands() {
+        let out = coalesce_ui(vec![
+            UiCommand::Meters(true),
+            UiCommand::Deactivate,
+            UiCommand::Meters(false),
+            UiCommand::Meters(true),
+        ]);
+        assert_eq!(out, vec![UiCommand::Deactivate, UiCommand::Meters(true)]);
     }
 }

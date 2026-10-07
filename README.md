@@ -37,6 +37,10 @@ Execute as provas da seção 6.3 numa sessão Linux com PipeWire/WirePlumber. Me
 
 ![Mixer em modo de demonstração](docs/imagens/mixer-demo.png)
 
+Medidores ao vivo dentro dos sliders (captura real: serviço + janela com um seno de −6 dBFS tocando em GAME):
+
+![Medidores ao vivo](docs/imagens/medidores-ao-vivo.png)
+
 ```sh
 cargo run -p iara-service                                 # serviço (cria nós iara.* no PipeWire da sessão)
 cargo run -p iara-ui --features gtk-ui                    # janela, conecta ao serviço
@@ -46,6 +50,8 @@ cargo run -p iara-ui --features gtk-ui -- --demo --screenshot captura.png   # gr
 
 `iara-service --restore-default` devolve a saída padrão anterior se um serviço anterior caiu deixando o Iara como padrão do sistema.
 
-`tools/provas/20-janela-entrada-real.sh` exercita a janela com mouse e teclado reais e pela acessibilidade (precisa de `xdotool` e `python-gobject`; move o ponteiro).
+`tools/provas/20-janela-entrada-real.sh` exercita a janela com mouse e teclado reais e pela acessibilidade (precisa de `xdotool` e `python-gobject`; move o ponteiro real, por isso se recusa a rodar com uma janela ou serviço do Iara já abertos).
+
+`tools/provas/22-medidores-motor.sh`, `23-medidores-janela.sh` e `24-medidores-custo.sh` rodam em um PipeWire, um D-Bus e (a 23 e a 24) uma tela **privados** (`tools/provas/lib_privado.sh`; precisam de `xorg-server-xvfb` e, de preferência, `openbox`): nada aparece na sua tela nem toca na sua sessão de áudio.
 
 `tools/provas/13-ui-ao-vivo.sh` abre a janela contra um serviço de teste, muda valores por fora (`busctl`) e captura o resultado.
