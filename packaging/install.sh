@@ -7,6 +7,9 @@ set -euo pipefail
 VERSION="0.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$SCRIPT_DIR"
+if [ ! -d "$ROOT_DIR/data" ] && [ -d "$ROOT_DIR/../data" ]; then
+  ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 
 # Encontra binários pré-compilados
 if [ -f "$ROOT_DIR/bin/iara-service" ] && [ -f "$ROOT_DIR/bin/iara-ui" ]; then
@@ -101,6 +104,7 @@ install -m 644 "$DATA_SRC/dev.iara.Mixer.desktop" "$APPSDIR/dev.iara.Mixer.deskt
 install -m 644 "$DATA_SRC/dev.iara.Mixer.metainfo.xml" "$METAINFODIR/dev.iara.Mixer.metainfo.xml"
 install -m 644 "$DATA_SRC/icons/hicolor/scalable/apps/dev.iara.Mixer.svg" "$ICONDIR/dev.iara.Mixer.svg"
 install -m 644 "$DATA_SRC/systemd/user/iara.service" "$SYSTEMD_DIR/iara.service"
+sed -i "s|ExecStart=.*|ExecStart=$BINDIR/iara-service|" "$SYSTEMD_DIR/iara.service"
 
 # Atualização de caches do desktop se disponíveis
 if command -v update-desktop-database >/dev/null 2>&1; then
