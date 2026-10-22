@@ -90,9 +90,9 @@ pub fn peak_to_db(peak: f32) -> f32 {
     }
 }
 
-/// dBFS → posição 0..=1 na barra (piso −60 dBFS = 0; 0 dBFS = 1).
+/// dBFS → posição 0..=1 na barra (piso −60 dBFS = 0; 0 dBFS = 1), na mesma curva dos sliders (`taper`).
 pub fn db_to_position(db: f32) -> f32 {
-    ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0)
+    crate::taper::db_to_position(f64::from(db)) as f32
 }
 
 fn send_amplitude(plan: &Plan, from: &str, to: &str) -> f32 {
@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(peak_to_db(0.0), f32::NEG_INFINITY);
         assert_eq!(db_to_position(0.0), 1.0);
         assert_eq!(db_to_position(-60.0), 0.0);
-        assert!((db_to_position(-30.0) - 0.5).abs() < 1e-6);
+        assert!((db_to_position(-15.0) - 0.5).abs() < 1e-6, "mesma curva dos sliders");
         assert_eq!(db_to_position(f32::NEG_INFINITY), 0.0);
         assert_eq!(db_to_position(6.0), 1.0, "acima de 0 dBFS satura");
     }

@@ -154,9 +154,9 @@ pub enum SessionChoice {
     Clear,
 }
 
-/// O retrato como trafega no D-Bus (assinatura `tsbsasussa(ssb)`): versão, perfil em TOML, conectado, erro de gravação,
-/// dispositivos ausentes, tentativas de reconexão, aplicativos em TOML, saída padrão, perfis (id, nome, legível) e dispositivos
-/// físicos de áudio (chave, descrição, é saída).
+/// O retrato como trafega no D-Bus: versão, perfil em TOML, conectado, erro de gravação,
+/// dispositivos ausentes, tentativas de reconexão, aplicativos em TOML, saída padrão, perfis (id, nome, legível),
+/// dispositivos físicos de áudio (chave, descrição, é saída) e saída física (volume: <0 = nenhum, mute).
 pub(crate) type StateWire = (
     u64,
     String,
@@ -168,6 +168,7 @@ pub(crate) type StateWire = (
     String,
     Vec<(String, String, bool)>,
     Vec<(String, String, bool)>,
+    (f64, bool),
 );
 
 /// Dispositivo físico de áudio que o usuário pode escolher (fone/alto-falantes ou microfone).
@@ -223,6 +224,10 @@ pub struct State {
     pub profiles: Vec<ProfileEntry>,
     /// Dispositivos físicos presentes agora.
     pub devices: Vec<DeviceEntry>,
+    /// Volume atual da saída física (0.0..=1.0).
+    pub output_volume: Option<f64>,
+    /// Mute atual da saída física.
+    pub output_muted: bool,
 }
 
 /// Quem atende o IPC: o serviço. Chamado de threads do D-Bus; deve responder com prazo.
@@ -239,4 +244,8 @@ pub trait Controller: Send + Sync + 'static {
     /// Algum cliente quer (ou nenhum quer mais) medidores ao vivo. Chamado só quando o conjunto de pedidos muda de vazio
     /// para não vazio e vice-versa.
     fn meters(&self, enabled: bool) -> Result<(), String>;
+    /// Define o volume da saída física (0.0..=1.0).
+    fn set_output_volume(&self, volume: f64) -> Result<(), String>;
+    /// Define o mute da saída física.
+    fn set_output_mute(&self, muted: bool) -> Result<(), String>;
 }

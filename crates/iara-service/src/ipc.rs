@@ -71,6 +71,8 @@ pub fn to_state(s: Snapshot) -> State {
         persist_error: s.status.persist_error,
         absent_devices: s.status.absent_devices,
         reconnect_attempts: s.status.reconnect_attempts,
+        output_volume: s.status.output_volume,
+        output_muted: s.status.output_muted,
     }
 }
 
@@ -130,6 +132,30 @@ impl Controller for ServiceController {
         self.tx
             .send(Msg::Command(Command::Edit {
                 cmd,
+                reply: Some(reply),
+            }))
+            .map_err(|_| "serviço encerrando".to_owned())?;
+        rx.recv_timeout(REPLY_TIMEOUT)
+            .map_err(|_| "o serviço não respondeu a tempo".to_owned())?
+    }
+
+    fn set_output_volume(&self, volume: f64) -> Result<(), String> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Msg::Command(Command::SetOutputVolume {
+                volume,
+                reply: Some(reply),
+            }))
+            .map_err(|_| "serviço encerrando".to_owned())?;
+        rx.recv_timeout(REPLY_TIMEOUT)
+            .map_err(|_| "o serviço não respondeu a tempo".to_owned())?
+    }
+
+    fn set_output_mute(&self, muted: bool) -> Result<(), String> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Msg::Command(Command::SetOutputMute {
+                muted,
                 reply: Some(reply),
             }))
             .map_err(|_| "serviço encerrando".to_owned())?;

@@ -63,7 +63,17 @@ impl Controller for Fake {
                     readable: false,
                 },
             ],
+            output_volume: Some(0.8),
+            output_muted: false,
         })
+    }
+
+    fn set_output_volume(&self, _volume: f64) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_output_mute(&self, _muted: bool) -> Result<(), String> {
+        Ok(())
     }
 
     fn profile_op(&self, op: ProfileOp) -> Result<String, String> {

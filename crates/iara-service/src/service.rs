@@ -32,6 +32,8 @@ pub trait Backend {
     fn set_default_sink(&mut self, name: Option<String>) -> Result<(), EngineError>;
     /// Liga os medidores nos barramentos dados (vazio desliga); os níveis voltam como `Event::Levels`.
     fn set_meters(&mut self, buses: Vec<String>) -> Result<(), EngineError>;
+    /// Define o volume e o mute da saída física.
+    fn set_output_volume(&mut self, volume: f64, muted: bool) -> Result<(), EngineError>;
 }
 
 impl Backend for Engine {
@@ -49,6 +51,10 @@ impl Backend for Engine {
 
     fn set_meters(&mut self, buses: Vec<String>) -> Result<(), EngineError> {
         Engine::set_meters(self, buses)
+    }
+
+    fn set_output_volume(&mut self, volume: f64, muted: bool) -> Result<(), EngineError> {
+        Engine::set_output_volume(self, volume, muted)
     }
 }
 
@@ -103,6 +109,16 @@ pub enum Command {
     },
     /// Alguma interface quer (ou deixou de querer) medidores ao vivo. Sem pedido, nenhum tap existe no grafo.
     Meters(bool),
+    /// Define o volume da saída física (0.0..=1.0).
+    SetOutputVolume {
+        volume: f64,
+        reply: Option<Reply<Result<(), String>>>,
+    },
+    /// Define o mute da saída física.
+    SetOutputMute {
+        muted: bool,
+        reply: Option<Reply<Result<(), String>>>,
+    },
     Shutdown,
 }
 
@@ -138,7 +154,7 @@ impl From<StoreError> for ServiceError {
 }
 
 /// O que a interface precisa mostrar (spec 6.2, 8.10): conexão, falha de gravação, último relatório, dispositivos ausentes.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Status {
     pub connected: bool,
     pub persist_error: Option<String>,
@@ -151,6 +167,10 @@ pub struct Status {
     pub default_output: DefaultOutput,
     /// Dispositivos físicos de áudio presentes agora (saídas e entradas).
     pub devices: Vec<iara_audio::DeviceInfo>,
+    /// Volume atual da saída física (0.0..=1.0).
+    pub output_volume: Option<f64>,
+    /// Mute atual da saída física.
+    pub output_muted: bool,
 }
 
 pub struct Service<B: Backend> {
@@ -753,6 +773,26 @@ impl<B: Backend> Service<B> {
                     self.sync_meters(now);
                 }
             }
+            Msg::Command(Command::SetOutputVolume { volume, reply }) => {
+                if let Some(b) = self.backend.as_mut() {
+                    let _ = b.set_output_volume(volume, self.status.output_muted);
+                }
+                self.status.output_volume = Some(volume);
+                self.changed();
+                if let Some(r) = reply {
+                    let _ = r.send(Ok(()));
+                }
+            }
+            Msg::Command(Command::SetOutputMute { muted, reply }) => {
+                if let Some(b) = self.backend.as_mut() {
+                    let _ = b.set_output_volume(self.status.output_volume.unwrap_or(1.0), muted);
+                }
+                self.status.output_muted = muted;
+                self.changed();
+                if let Some(r) = reply {
+                    let _ = r.send(Ok(()));
+                }
+            }
             Msg::Engine(Event::Levels(peaks)) => {
                 let quiet = peaks.values().all(|p| *p <= 0.0);
                 if quiet && !self.levels_sounding {
@@ -768,6 +808,17 @@ impl<B: Backend> Service<B> {
                             .collect());
                     }
                     self.levels_sounding = sounding;
+                }
+            }
+            Msg::Engine(Event::OutputVolume { volume, muted }) => {
+                let changed = match self.status.output_volume {
+                    None => true,
+                    Some(v) => (v - volume).abs() > 0.005 || self.status.output_muted != muted,
+                };
+                if changed {
+                    self.status.output_volume = Some(volume);
+                    self.status.output_muted = muted;
+                    self.changed();
                 }
             }
             Msg::Engine(Event::Disconnected) => self.drop_backend(now),
@@ -893,6 +944,10 @@ mod tests {
 
         fn set_meters(&mut self, buses: Vec<String>) -> Result<(), EngineError> {
             self.0.meters.borrow_mut().push(buses);
+            Ok(())
+        }
+
+        fn set_output_volume(&mut self, _volume: f64, _muted: bool) -> Result<(), EngineError> {
             Ok(())
         }
     }

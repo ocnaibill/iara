@@ -101,10 +101,16 @@ impl Client {
             default_output,
             profiles,
             devices,
+            (output_vol_raw, output_muted),
         ): crate::StateWire = self.proxy.call("GetState", &())?;
         let apps = crate::apps_from_toml(&apps).map_err(ClientError::Rejected)?;
         let profile = iara_store::profile_from_toml(&toml)
             .map_err(|e| ClientError::Rejected(e.to_string()))?;
+        let output_volume = if output_vol_raw >= 0.0 {
+            Some(output_vol_raw)
+        } else {
+            None
+        };
         Ok(State {
             serial,
             profile,
@@ -126,6 +132,8 @@ impl Client {
                     output,
                 })
                 .collect(),
+            output_volume,
+            output_muted,
         })
     }
 
@@ -240,6 +248,16 @@ impl Client {
     /// se o processo cair, o serviço solta o pedido sozinho.
     pub fn set_meters(&self, enabled: bool) -> Result<(), ClientError> {
         Ok(self.proxy.call("SetMeters", &(enabled,))?)
+    }
+
+    /// Define o volume da saída física (0.0..=1.0).
+    pub fn set_output_volume(&self, volume: f64) -> Result<(), ClientError> {
+        Ok(self.proxy.call("SetOutputVolume", &(volume,))?)
+    }
+
+    /// Define o mute da saída física.
+    pub fn set_output_mute(&self, muted: bool) -> Result<(), ClientError> {
+        Ok(self.proxy.call("SetOutputMute", &(muted,))?)
     }
 
     /// Assina o sinal `Levels` (pico linear por slider). Só chega algo depois de `set_meters(true)`.

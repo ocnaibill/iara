@@ -64,6 +64,11 @@ pub enum Event {
     },
     /// Picos lineares (0..) por barramento desde o evento anterior; só enquanto os medidores estão ligados.
     Levels(HashMap<String, f32>),
+    /// Volume e mute do dispositivo físico de saída (0.0..=1.0).
+    OutputVolume {
+        volume: f64,
+        muted: bool,
+    },
 }
 
 /// Resultado de uma aplicação. `missing` lista os nós esperados que não apareceram no registro dentro do prazo;
@@ -91,6 +96,8 @@ enum Command {
     Apply(Box<Plan>, Reply),
     /// Liga os medidores nos barramentos dados (substitui o conjunto anterior); lista vazia desliga.
     SetMeters(Vec<String>),
+    /// Define o volume e mute do dispositivo físico de saída (0.0..=1.0).
+    SetOutputVolume(f64, bool),
     Shutdown,
 }
 
@@ -169,6 +176,13 @@ impl Engine {
     pub fn set_meters(&self, buses: Vec<String>) -> Result<(), EngineError> {
         self.tx
             .send(Command::SetMeters(buses))
+            .map_err(|_| EngineError::Disconnected)
+    }
+
+    /// Define o volume e o mute do dispositivo de saída (repassado ao dispositivo físico e ao padrão do sistema).
+    pub fn set_output_volume(&self, volume: f64, muted: bool) -> Result<(), EngineError> {
+        self.tx
+            .send(Command::SetOutputVolume(volume, muted))
             .map_err(|_| EngineError::Disconnected)
     }
 
@@ -297,6 +311,12 @@ struct State {
     last_devices: Option<Vec<crate::DeviceInfo>>,
     /// Taps de medição ativos (vazio quando nenhuma interface pede medidores).
     taps: crate::meters::Taps,
+    /// Volume atual e mute do dispositivo de saída (volume, mute).
+    output_volume: Option<(f64, bool)>,
+    /// Último volume observado em iara.unassigned (para sincronização sem laço).
+    last_unassigned_vol: Option<(f64, bool)>,
+    /// Contador de ticks para o sincronizador de volume (evita chamadas excessivas).
+    volume_tick: u32,
 }
 
 fn props_pod(prop: u32, value: Value) -> Vec<u8> {
@@ -335,11 +355,21 @@ fn in_name(branch: &str) -> String {
 }
 
 fn node_props(spec: &NodeSpec) -> pw::properties::PropertiesBox {
+    let media_class = match spec.role {
+        iara_core::topology::NodeRole::Channel | iara_core::topology::NodeRole::Unassigned => {
+            "Audio/Sink"
+        }
+        iara_core::topology::NodeRole::Mix
+        | iara_core::topology::NodeRole::Master
+        | iara_core::topology::NodeRole::MicInput
+        | iara_core::topology::NodeRole::MicCommon
+        | iara_core::topology::NodeRole::MicApps => "Audio/Sink/Internal",
+    };
     pw::properties::properties! {
         "factory.name" => "support.null-audio-sink",
         "node.name" => spec.name.as_str(),
         "node.description" => spec.description.as_str(),
-        "media.class" => "Audio/Sink",
+        "media.class" => media_class,
         "audio.position" => "[FL FR]",
         "priority.session" => "0",
         "priority.driver" => "0",
@@ -412,12 +442,106 @@ fn load_module(context: &pw::context::ContextRc, args: &str) -> Option<ModuleHan
     (!m.is_null()).then(|| ModuleHandle::new(m))
 }
 
-fn device_present(st: &State, d: &DeviceLink) -> bool {
-    st.nodes_present.values().any(|n| *n == d.physical)
+fn resolve_link_physical(st: &State, d: &DeviceLink) -> Option<String> {
+    if st.nodes_present.values().any(|n| *n == d.physical) {
+        return Some(d.physical.clone());
+    }
+    let is_output = matches!(d.direction, DeviceDirection::Output);
+    let dev_list: Vec<crate::DeviceInfo> = st.devices_seen.values().cloned().collect();
+    crate::devices::resolve_device(&d.physical, is_output, &dev_list).map(str::to_owned)
 }
 
-/// Cria/remove as ligações com dispositivos físicos conforme a presença no registro. Nunca recria com outro
-/// dispositivo: o plano é a única fonte do dispositivo preferido (a escolha do usuário durante a ausência é um novo plano).
+fn device_present(st: &State, d: &DeviceLink) -> bool {
+    resolve_link_physical(st, d).is_some()
+}
+
+/// Lê o volume e o mute de um nó via wpctl.
+pub fn read_node_volume(id: u32) -> Option<(f64, bool)> {
+    let out = std::process::Command::new("wpctl")
+        .args(["get-volume", &id.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut parts = s.split_whitespace();
+    if parts.next()? != "Volume:" {
+        return None;
+    }
+    let vol: f64 = parts.next()?.parse().ok()?;
+    let muted = parts.any(|p| p == "[MUTED]");
+    Some((vol, muted))
+}
+
+/// Aplica o volume e o mute de um nó via wpctl.
+pub fn write_node_volume(id: u32, volume: f64, muted: bool) {
+    let vol_str = format!("{:.3}", volume.clamp(0.0, 1.5));
+    let _ = std::process::Command::new("wpctl")
+        .args(["set-volume", &id.to_string(), &vol_str])
+        .status();
+    let mute_str = if muted { "1" } else { "0" };
+    let _ = std::process::Command::new("wpctl")
+        .args(["set-mute", &id.to_string(), mute_str])
+        .status();
+}
+
+/// Sincroniza o volume do dispositivo físico de saída e de `iara.unassigned` (teclas de volume e slider do sistema).
+fn reconcile_device_volume(st: &mut State, ev: &EventSink) {
+    let output_link = st.devices.iter().find(|d| d.direction == DeviceDirection::Output);
+    let Some(d) = output_link else {
+        return;
+    };
+    let Some(phys_name) = resolve_link_physical(st, d) else {
+        return;
+    };
+    let phys_id = st
+        .nodes_present
+        .iter()
+        .find(|(_, n)| **n == phys_name)
+        .map(|(id, _)| *id);
+    let unassigned_id = st
+        .nodes_present
+        .iter()
+        .find(|(_, n)| **n == iara_core::topology::UNASSIGNED)
+        .map(|(id, _)| *id);
+
+    let Some(pid) = phys_id else {
+        return;
+    };
+
+    // Leitura inicial
+    if st.output_volume.is_none() {
+        if let Some((vol, muted)) = read_node_volume(pid) {
+            st.output_volume = Some((vol, muted));
+            st.last_unassigned_vol = Some((vol, muted));
+            if let Some(uid) = unassigned_id {
+                write_node_volume(uid, vol, muted);
+            }
+            ev(Event::OutputVolume { volume: vol, muted });
+        }
+        return;
+    }
+
+    // Teclas / slider do sistema alteraram iara.unassigned
+    if let Some(uid) = unassigned_id {
+        if let Some((u_vol, u_muted)) = read_node_volume(uid) {
+            let changed = match st.last_unassigned_vol {
+                None => true,
+                Some((last_v, last_m)) => (last_v - u_vol).abs() > 0.008 || last_m != u_muted,
+            };
+            if changed {
+                st.last_unassigned_vol = Some((u_vol, u_muted));
+                st.output_volume = Some((u_vol, u_muted));
+                write_node_volume(pid, u_vol, u_muted);
+                ev(Event::OutputVolume { volume: u_vol, muted: u_muted });
+            }
+        }
+    }
+}
+
+/// Cria/remove as ligações com dispositivos físicos conforme a presença no registro.
+/// Tolerante a troca de porta USB via `resolve_link_physical`.
 fn reconcile_devices(st: &mut State, context: &pw::context::ContextRc, ev: &EventSink) {
     let desired = st.devices.clone();
     let stale: Vec<String> = st
@@ -425,7 +549,8 @@ fn reconcile_devices(st: &mut State, context: &pw::context::ContextRc, ev: &Even
         .iter()
         .filter(|(name, (physical, handle))| {
             desired.iter().find(|d| &d.name == *name).is_none_or(|d| {
-                d.physical != *physical || !handle.is_alive() || !device_present(st, d)
+                let resolved = resolve_link_physical(st, d);
+                resolved.as_deref() != Some(physical) || !handle.is_alive()
             })
         })
         .map(|(name, _)| name.clone())
@@ -434,7 +559,8 @@ fn reconcile_devices(st: &mut State, context: &pw::context::ContextRc, ev: &Even
         st.device_modules.remove(&name);
     }
     for d in &desired {
-        let present = device_present(st, d);
+        let resolved = resolve_link_physical(st, d);
+        let present = resolved.is_some();
         match (st.device_present.insert(d.name.clone(), present), present) {
             (None | Some(true), false) => {
                 ev(Event::DeviceAbsent(d.physical.clone()));
@@ -448,15 +574,19 @@ fn reconcile_devices(st: &mut State, context: &pw::context::ContextRc, ev: &Even
             .retry_after
             .get(&d.name)
             .is_none_or(|t| Instant::now() >= *t);
-        if present && ready && !st.device_modules.contains_key(&d.name) {
-            st.retry_after
-                .insert(d.name.clone(), Instant::now() + DEVICE_RETRY);
-            match load_module(context, &device_args(d)) {
-                Some(m) => {
-                    st.device_modules
-                        .insert(d.name.clone(), (d.physical.clone(), m));
+        if let (Some(target_phys), true) = (resolved, ready) {
+            if !st.device_modules.contains_key(&d.name) {
+                st.retry_after
+                    .insert(d.name.clone(), Instant::now() + DEVICE_RETRY);
+                let mut actual_d = d.clone();
+                actual_d.physical = target_phys;
+                match load_module(context, &device_args(&actual_d)) {
+                    Some(m) => {
+                        st.device_modules
+                            .insert(d.name.clone(), (actual_d.physical.clone(), m));
+                    }
+                    None => eprintln!("iara-audio: falha ao ligar o dispositivo {}", actual_d.physical),
                 }
-                None => eprintln!("iara-audio: falha ao ligar o dispositivo {}", d.physical),
             }
         }
     }
@@ -897,10 +1027,17 @@ fn run(
                 ml_t.quit();
                 return;
             }
-            reconcile_devices(&mut st.borrow_mut(), &ctx, &ev);
-            reconcile_routes(&mut st.borrow_mut(), &ev);
-            report_devices(&mut st.borrow_mut(), &ev);
-            reap_retiring(&mut st.borrow_mut(), &core_t);
+            {
+                let mut s = st.borrow_mut();
+                s.volume_tick = s.volume_tick.wrapping_add(1);
+                if s.volume_tick.is_multiple_of(2) {
+                    reconcile_device_volume(&mut s, &ev);
+                }
+                reconcile_devices(&mut s, &ctx, &ev);
+                reconcile_routes(&mut s, &ev);
+                report_devices(&mut s, &ev);
+                reap_retiring(&mut s, &core_t);
+            }
             check_pending(&st, false);
         })
     };
@@ -944,6 +1081,22 @@ fn run(
                 let mut s = st.borrow_mut();
                 s.routes = routes;
                 reconcile_routes(&mut s, &ev);
+            }
+            Command::SetOutputVolume(vol, muted) => {
+                let mut s = st.borrow_mut();
+                s.output_volume = Some((vol, muted));
+                s.last_unassigned_vol = Some((vol, muted));
+                if let Some(d) = s.devices.iter().find(|d| d.direction == DeviceDirection::Output) {
+                    if let Some(phys_name) = resolve_link_physical(&s, d) {
+                        if let Some(pid) = s.nodes_present.iter().find(|(_, n)| **n == phys_name).map(|(id, _)| *id) {
+                            write_node_volume(pid, vol, muted);
+                        }
+                    }
+                }
+                if let Some(uid) = s.nodes_present.iter().find(|(_, n)| **n == iara_core::topology::UNASSIGNED).map(|(id, _)| *id) {
+                    write_node_volume(uid, vol, muted);
+                }
+                ev(Event::OutputVolume { volume: vol, muted });
             }
             Command::Apply(plan, reply) => apply(&st, &core, &ctx, &ev, *plan, reply),
         })

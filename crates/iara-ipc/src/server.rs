@@ -90,6 +90,7 @@ pub(crate) fn state_to_tuple(s: &State) -> Result<crate::StateWire, String> {
             .iter()
             .map(|d| (d.key.clone(), d.description.clone(), d.output))
             .collect(),
+        (s.output_volume.unwrap_or(-1.0), s.output_muted),
     ))
 }
 
@@ -310,6 +311,20 @@ impl Mixer {
             .map(|s| s.to_string())
             .ok_or_else(|| fdo::Error::InvalidArgs("chamada sem remetente".into()))?;
         self.leases.set(&who, enabled).map_err(fdo::Error::Failed)
+    }
+
+    /// Define o volume da saída física (0.0..=1.0).
+    fn set_output_volume(&self, volume: f64) -> fdo::Result<()> {
+        self.controller
+            .set_output_volume(volume)
+            .map_err(fdo::Error::InvalidArgs)
+    }
+
+    /// Define o mute da saída física.
+    fn set_output_mute(&self, muted: bool) -> fdo::Result<()> {
+        self.controller
+            .set_output_mute(muted)
+            .map_err(fdo::Error::InvalidArgs)
     }
 
     /// O retrato mudou (perfil ou status); releia com `GetState`.
