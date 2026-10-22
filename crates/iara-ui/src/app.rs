@@ -352,10 +352,18 @@ fn set_gain_steps(scale: &gtk::Scale) {
     adj.set_page_increment(0.05);
     scale.connect_change_value(|s, scroll, _| {
         let delta = match scroll {
-            gtk::ScrollType::StepForward | gtk::ScrollType::StepUp | gtk::ScrollType::StepRight => 1.0,
-            gtk::ScrollType::StepBackward | gtk::ScrollType::StepDown | gtk::ScrollType::StepLeft => -1.0,
-            gtk::ScrollType::PageForward | gtk::ScrollType::PageUp | gtk::ScrollType::PageRight => 6.0,
-            gtk::ScrollType::PageBackward | gtk::ScrollType::PageDown | gtk::ScrollType::PageLeft => -6.0,
+            gtk::ScrollType::StepForward | gtk::ScrollType::StepUp | gtk::ScrollType::StepRight => {
+                1.0
+            }
+            gtk::ScrollType::StepBackward
+            | gtk::ScrollType::StepDown
+            | gtk::ScrollType::StepLeft => -1.0,
+            gtk::ScrollType::PageForward | gtk::ScrollType::PageUp | gtk::ScrollType::PageRight => {
+                6.0
+            }
+            gtk::ScrollType::PageBackward
+            | gtk::ScrollType::PageDown
+            | gtk::ScrollType::PageLeft => -6.0,
             _ => return glib::Propagation::Proceed,
         };
         s.set_value(step_position(s.value(), delta));

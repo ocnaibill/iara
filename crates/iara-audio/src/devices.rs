@@ -135,8 +135,7 @@ pub fn resolve_device<'a>(
     let matches: Vec<&DeviceInfo> = present_devices
         .iter()
         .filter(|d| {
-            d.output == is_output
-                && is_matching_device(desired_physical, &d.name, &d.description)
+            d.output == is_output && is_matching_device(desired_physical, &d.name, &d.description)
         })
         .collect();
     if matches.len() == 1 {
@@ -256,11 +255,7 @@ mod tests {
 
         // 1) Match exato
         assert_eq!(
-            resolve_device(
-                "alsa_output.pci-0000_0b_00.4.analog-stereo",
-                true,
-                &devices
-            ),
+            resolve_device("alsa_output.pci-0000_0b_00.4.analog-stereo", true, &devices),
             Some("alsa_output.pci-0000_0b_00.4.analog-stereo")
         );
 

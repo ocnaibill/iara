@@ -594,8 +594,15 @@ mod tests {
         let at = |d: f64| gain_to_position(Gain::from_db(d).unwrap());
         assert!((db(step_position(at(-10.0), 1.0)).unwrap() + 9.0).abs() < 1e-6);
         assert!((db(step_position(at(-10.0), -6.0)).unwrap() + 16.0).abs() < 1e-6);
-        assert_eq!(db(step_position(at(-0.5), 1.0)), Some(0.0), "satura em 0 dB");
-        assert!((db(step_position(0.0, 1.0)).unwrap() + 60.0).abs() < 1e-3, "do silêncio ao piso");
+        assert_eq!(
+            db(step_position(at(-0.5), 1.0)),
+            Some(0.0),
+            "satura em 0 dB"
+        );
+        assert!(
+            (db(step_position(0.0, 1.0)).unwrap() + 60.0).abs() < 1e-3,
+            "do silêncio ao piso"
+        );
         assert_eq!(step_position(at(-60.0), -1.0), 0.0, "do piso ao silêncio");
         assert_eq!(step_position(0.0, -1.0), 0.0);
         assert!((db(step_position(at(-59.5), -1.0)).unwrap() + 60.0).abs() < 1e-3);

@@ -488,7 +488,10 @@ pub fn write_node_volume(id: u32, volume: f64, muted: bool) {
 
 /// Sincroniza o volume do dispositivo físico de saída e de `iara.unassigned` (teclas de volume e slider do sistema).
 fn reconcile_device_volume(st: &mut State, ev: &EventSink) {
-    let output_link = st.devices.iter().find(|d| d.direction == DeviceDirection::Output);
+    let output_link = st
+        .devices
+        .iter()
+        .find(|d| d.direction == DeviceDirection::Output);
     let Some(d) = output_link else {
         return;
     };
@@ -534,7 +537,10 @@ fn reconcile_device_volume(st: &mut State, ev: &EventSink) {
                 st.last_unassigned_vol = Some((u_vol, u_muted));
                 st.output_volume = Some((u_vol, u_muted));
                 write_node_volume(pid, u_vol, u_muted);
-                ev(Event::OutputVolume { volume: u_vol, muted: u_muted });
+                ev(Event::OutputVolume {
+                    volume: u_vol,
+                    muted: u_muted,
+                });
             }
         }
     }
@@ -585,7 +591,10 @@ fn reconcile_devices(st: &mut State, context: &pw::context::ContextRc, ev: &Even
                         st.device_modules
                             .insert(d.name.clone(), (actual_d.physical.clone(), m));
                     }
-                    None => eprintln!("iara-audio: falha ao ligar o dispositivo {}", actual_d.physical),
+                    None => eprintln!(
+                        "iara-audio: falha ao ligar o dispositivo {}",
+                        actual_d.physical
+                    ),
                 }
             }
         }
@@ -1086,14 +1095,28 @@ fn run(
                 let mut s = st.borrow_mut();
                 s.output_volume = Some((vol, muted));
                 s.last_unassigned_vol = Some((vol, muted));
-                if let Some(d) = s.devices.iter().find(|d| d.direction == DeviceDirection::Output) {
+                if let Some(d) = s
+                    .devices
+                    .iter()
+                    .find(|d| d.direction == DeviceDirection::Output)
+                {
                     if let Some(phys_name) = resolve_link_physical(&s, d) {
-                        if let Some(pid) = s.nodes_present.iter().find(|(_, n)| **n == phys_name).map(|(id, _)| *id) {
+                        if let Some(pid) = s
+                            .nodes_present
+                            .iter()
+                            .find(|(_, n)| **n == phys_name)
+                            .map(|(id, _)| *id)
+                        {
                             write_node_volume(pid, vol, muted);
                         }
                     }
                 }
-                if let Some(uid) = s.nodes_present.iter().find(|(_, n)| **n == iara_core::topology::UNASSIGNED).map(|(id, _)| *id) {
+                if let Some(uid) = s
+                    .nodes_present
+                    .iter()
+                    .find(|(_, n)| **n == iara_core::topology::UNASSIGNED)
+                    .map(|(id, _)| *id)
+                {
                     write_node_volume(uid, vol, muted);
                 }
                 ev(Event::OutputVolume { volume: vol, muted });
