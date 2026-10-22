@@ -83,7 +83,7 @@ $AT act "Mover só nesta sessão" >/dev/null 2>&1
 
 echo "== controles do mixer com o mouse e o teclado reais"
 sdrag 280 228 280 313
-g=$(gain game personal); check "arrastar o slider de escuta do GAME ao meio dá cerca de −30 dB ($g)" 'python3 -c "import sys; g=float(sys.argv[1]); sys.exit(0 if -40<g<-20 else 1)" "$g"'
+g=$(gain game personal); check "arrastar o slider de escuta do GAME ao meio dá cerca de −15 dB ($g)" 'python3 -c "import sys; g=float(sys.argv[1]); sys.exit(0 if -22<g<-8 else 1)" "$g"'
 sclick 280 313; g1=$(gain game personal)
 for k in Up Up Up Up Up; do xdotool key $k; sleep 0.2; done; sleep 1; g2=$(gain game personal)
 check "5 setas ↑ no slider = +5 dB exatos ($g1 → $g2)" 'python3 -c "import sys; d=float(sys.argv[2])-float(sys.argv[1]); sys.exit(0 if abs(d-5)<0.2 else 1)" "$g1" "$g2"'

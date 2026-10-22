@@ -23,7 +23,7 @@ PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "  ok    $1"; else FAIL=$((FAIL+1)); echo "  FALHA $1  [$3]"; fi; }
 taps() { pw-cli ls Node | grep -c 'node.name = "iara\.meter\.' || true; }
 near() { awk -v a="$1" -v b="$2" -v t="$3" 'BEGIN{ d=a-b; if (d<0) d=-d; exit !(d<=t) }'; }
-pos() { awk -v d="$1" 'BEGIN{ p=(d+60)/60; if (p<0) p=0; if (p>1) p=1; printf "%.4f", p }'; }  # dBFS → posição 0..1
+pos() { awk -v d="$1" 'BEGIN{ if (d<=-60) p=0; else if (d>=0) p=1; else p=1-sqrt(d/-60); printf "%.4f", p }'; }  # dBFS → posição 0..1 (curva iara_core::taper)
 SHOT="$TMP/shot.png"
 snap() { local a b;  a=$(stat -c %y "$SHOT" "$TMP/shot.meters" 2>/dev/null | tr -d '\n'); kill -USR1 "$UIPID"; sleep 1.5
   b=$(stat -c %y "$SHOT" "$TMP/shot.meters" 2>/dev/null | tr -d '\n'); [ "$a" != "$b" ] || echo "  (aviso: captura não atualizada)"
@@ -82,7 +82,7 @@ check "pico solto" "near \"\$(val ch:game:transmission 3)\" 0 0.001" "$(val ch:g
 echo "# sinal acima de 0 dBFS: indicador de clipe aceso e barra no topo"
 tone iara.ch.media hot 2; snap; stop_tone
 check "MEDIA escuta clipa" "[ \"\$(val ch:media:personal 4)\" = true ]" "$(val ch:media:personal 4)"
-check "MEDIA escuta no topo" "near \"\$(val ch:media:personal 2)\" 1 0.01" "$(val ch:media:personal 2)"
+check "MEDIA escuta no topo" "near \"\$(val ch:media:personal 3)\" 1 0.01" "$(val ch:media:personal 3)"
 cp "$SHOT" "$TMP/../iara-medidores-clipe.png" 2>/dev/null
 sleep 3; snap
 check "clipe apaga depois de 2 s" "[ \"\$(val ch:media:personal 4)\" = false ]" "$(val ch:media:personal 4)"

@@ -5,8 +5,8 @@ use crate::backend::{Backend, OnUpdate, Update};
 use crate::meters::{MeterBoard, MeterView};
 use crate::model::{
     active_profile_label, chatmix_view, chips_by_column, columns, device_choices, move_app,
-    position_to_gain, profile_rows, reapply_rule, slug, status_lines, AppChip, ColumnKind,
-    ColumnView, SendView, StatusKind, UiCommand,
+    position_to_gain, profile_rows, reapply_rule, slug, status_lines, step_position, AppChip,
+    ColumnKind, ColumnView, SendView, StatusKind, UiCommand,
 };
 use gtk::prelude::*;
 use gtk::{gdk, glib};
@@ -92,18 +92,6 @@ struct AppsCtx {
     device_button: gtk::MenuButton,
 }
 
-/// Seletores de dispositivo físico dentro do popover da engrenagem do MASTER.
-struct DevicePicker {
-    output: gtk::DropDown,
-    input: gtk::DropDown,
-    output_hint: gtk::Label,
-    input_hint: gtk::Label,
-    /// Chaves das opções atuais de cada seletor (índice → chave; `None` = nenhum).
-    output_keys: Rc<RefCell<Vec<Option<String>>>>,
-    input_keys: Rc<RefCell<Vec<Option<String>>>>,
-    sig: RefCell<String>,
-}
-
 fn dropdown_selector(
     caption: &str,
     accessible: &str,
@@ -138,7 +126,10 @@ fn dropdown_selector(
 }
 
 /// Engrenagem + popover "Dispositivos" da coluna MASTER (spec 8.5, 8.6, 8.12).
-fn build_device_menu(emit: &Emit, updating: &Rc<Cell<bool>>) -> (gtk::MenuButton, DevicePicker) {
+fn build_device_menu(
+    emit_ui: &Rc<dyn Fn(UiCommand)>,
+    updating: &Rc<Cell<bool>>,
+) -> (gtk::MenuButton, DevicePicker) {
     let pop = gtk::Popover::new();
     let bx = gtk::Box::new(gtk::Orientation::Vertical, 10);
     for set in [
@@ -161,21 +152,62 @@ fn build_device_menu(emit: &Emit, updating: &Rc<Cell<bool>>) -> (gtk::MenuButton
     bx.append(&intro);
     let output_keys: Rc<RefCell<Vec<Option<String>>>> = Rc::default();
     let input_keys: Rc<RefCell<Vec<Option<String>>>> = Rc::default();
-    let (e1, e2) = (emit.clone(), emit.clone());
+    let (e1, e2) = (emit_ui.clone(), emit_ui.clone());
     let (out_box, output, output_hint) = dropdown_selector(
         "SAÍDA (FONE OU ALTO-FALANTES)",
         "Saída do mix pessoal (fone ou alto-falantes)",
         &output_keys,
         updating,
-        move |key| e1(EditCommand::SetPreferredOutput(key)),
+        move |key| e1(UiCommand::Edit(EditCommand::SetPreferredOutput(key))),
     );
     let (in_box, input, input_hint) = dropdown_selector(
         "MICROFONE",
         "Entrada do microfone",
         &input_keys,
         updating,
-        move |key| e2(EditCommand::SetPreferredMicrophone(key)),
+        move |key| e2(UiCommand::Edit(EditCommand::SetPreferredMicrophone(key))),
     );
+
+    // Volume do dispositivo físico de saída (fone/caixas)
+    let vol_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    vol_box.set_margin_top(4);
+    let output_vol_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.01);
+    output_vol_scale.set_hexpand(true);
+    output_vol_scale.set_draw_value(false);
+    output_vol_scale.set_value(1.0);
+    output_vol_scale.update_property(&[gtk::accessible::Property::Label(
+        "Volume físico do dispositivo de saída",
+    )]);
+    let output_vol_label = label("100%", "value");
+    output_vol_label.set_width_chars(5);
+    let output_mute_btn = toggle(
+        "audio-volume-high-symbolic",
+        "Silenciar dispositivo de saída físico",
+        &["mute"],
+    );
+    vol_box.append(&output_mute_btn);
+    vol_box.append(&output_vol_scale);
+    vol_box.append(&output_vol_label);
+    out_box.append(&label("VOLUME DO DISPOSITIVO (FONE)", "strip-caption"));
+    out_box.append(&vol_box);
+
+    {
+        let (u, e) = (updating.clone(), emit_ui.clone());
+        output_vol_scale.connect_value_changed(move |s| {
+            if !u.get() {
+                e(UiCommand::SetOutputVolume(s.value()));
+            }
+        });
+    }
+    {
+        let (u, e) = (updating.clone(), emit_ui.clone());
+        output_mute_btn.connect_toggled(move |b| {
+            if !u.get() {
+                e(UiCommand::SetOutputMute(b.is_active()));
+            }
+        });
+    }
+
     bx.append(&out_box);
     bx.append(&in_box);
     pop.set_child(Some(&bx));
@@ -197,9 +229,27 @@ fn build_device_menu(emit: &Emit, updating: &Rc<Cell<bool>>) -> (gtk::MenuButton
             input_hint,
             output_keys,
             input_keys,
+            output_vol_scale,
+            output_vol_label,
+            output_mute_btn,
+            last_vol_sig: RefCell::new(String::new()),
             sig: RefCell::new(String::new()),
         },
     )
+}
+
+struct DevicePicker {
+    output: gtk::DropDown,
+    input: gtk::DropDown,
+    output_hint: gtk::Label,
+    input_hint: gtk::Label,
+    output_keys: Rc<RefCell<Vec<Option<String>>>>,
+    input_keys: Rc<RefCell<Vec<Option<String>>>>,
+    output_vol_scale: gtk::Scale,
+    output_vol_label: gtk::Label,
+    output_mute_btn: gtk::ToggleButton,
+    last_vol_sig: RefCell<String>,
+    sig: RefCell<String>,
 }
 
 impl DevicePicker {
@@ -208,36 +258,50 @@ impl DevicePicker {
         let (outs, out_sel) = device_choices(state, true);
         let (ins, in_sel) = device_choices(state, false);
         let sig = format!("{outs:?}{out_sel}{ins:?}{in_sel}");
-        if *self.sig.borrow() == sig {
-            return;
+        if *self.sig.borrow() != sig {
+            *self.sig.borrow_mut() = sig;
+            for (dd, choices, sel, keys, hint) in [
+                (
+                    &self.output,
+                    &outs,
+                    out_sel,
+                    &self.output_keys,
+                    &self.output_hint,
+                ),
+                (
+                    &self.input,
+                    &ins,
+                    in_sel,
+                    &self.input_keys,
+                    &self.input_hint,
+                ),
+            ] {
+                *keys.borrow_mut() = choices.iter().map(|c| c.key.clone()).collect();
+                let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
+                dd.set_model(Some(&gtk::StringList::new(&labels)));
+                dd.set_selected(sel as u32);
+                hint.set_text(if choices[sel].absent {
+                    "Este dispositivo não está conectado agora; a escolha continua registrada e volta sozinha quando ele reaparecer."
+                } else if choices[sel].key.is_none() {
+                    "Sem dispositivo escolhido: este lado fica sem som."
+                } else {
+                    ""
+                });
+            }
         }
-        *self.sig.borrow_mut() = sig;
-        for (dd, choices, sel, keys, hint) in [
-            (
-                &self.output,
-                &outs,
-                out_sel,
-                &self.output_keys,
-                &self.output_hint,
-            ),
-            (
-                &self.input,
-                &ins,
-                in_sel,
-                &self.input_keys,
-                &self.input_hint,
-            ),
-        ] {
-            *keys.borrow_mut() = choices.iter().map(|c| c.key.clone()).collect();
-            let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
-            dd.set_model(Some(&gtk::StringList::new(&labels)));
-            dd.set_selected(sel as u32);
-            hint.set_text(if choices[sel].absent {
-                "Este dispositivo não está conectado agora; a escolha continua registrada e volta sozinha quando ele reaparecer."
-            } else if choices[sel].key.is_none() {
-                "Sem dispositivo escolhido: este lado fica sem som."
+
+        let vol = state.output_volume.unwrap_or(1.0);
+        let vol_sig = format!("{:.3}:{}", vol, state.output_muted);
+        if *self.last_vol_sig.borrow() != vol_sig {
+            *self.last_vol_sig.borrow_mut() = vol_sig;
+            self.output_vol_scale.set_value(vol);
+            self.output_vol_label
+                .set_text(&format!("{:.0}%", (vol * 100.0).round()));
+            self.output_mute_btn.set_active(state.output_muted);
+            self.output_mute_btn.set_icon_name(if state.output_muted {
+                "audio-volume-muted-symbolic"
             } else {
-                ""
+                "audio-volume-high-symbolic"
             });
         }
     }
@@ -280,11 +344,23 @@ struct Handlers {
     enable: Option<Box<dyn Fn(bool)>>,
 }
 
-/// Passos de teclado de um slider de ganho: posição 1,0 = 60 dB, então 1 dB = 1/60.
+/// Passos de teclado de um slider de ganho: 1 dB por seta e 6 dB por Page, contados em dB (a curva não é linear, então os
+/// passos da `Adjustment` não servem: o `change-value` do teclado é interceptado; arrastar e rolar seguem o padrão).
 fn set_gain_steps(scale: &gtk::Scale) {
     let adj = scale.adjustment();
-    adj.set_step_increment(1.0 / 60.0);
-    adj.set_page_increment(6.0 / 60.0);
+    adj.set_step_increment(0.01);
+    adj.set_page_increment(0.05);
+    scale.connect_change_value(|s, scroll, _| {
+        let delta = match scroll {
+            gtk::ScrollType::StepForward | gtk::ScrollType::StepUp | gtk::ScrollType::StepRight => 1.0,
+            gtk::ScrollType::StepBackward | gtk::ScrollType::StepDown | gtk::ScrollType::StepLeft => -1.0,
+            gtk::ScrollType::PageForward | gtk::ScrollType::PageUp | gtk::ScrollType::PageRight => 6.0,
+            gtk::ScrollType::PageBackward | gtk::ScrollType::PageDown | gtk::ScrollType::PageLeft => -6.0,
+            _ => return glib::Propagation::Proceed,
+        };
+        s.set_value(step_position(s.value(), delta));
+        glib::Propagation::Stop
+    });
 }
 
 fn label(text: &str, class: &str) -> gtk::Label {
@@ -1555,6 +1631,8 @@ pub fn demo_state() -> State {
                 AppState::Outside,
             ),
         ],
+        output_volume: Some(1.0),
+        output_muted: false,
     }
 }
 
@@ -1635,7 +1713,7 @@ fn build_ui(app: &gtk::Application, opts: &Options) {
         Rc::new(move |cmd| e(UiCommand::Edit(cmd)))
     };
     let updating = Rc::new(Cell::new(false));
-    let (device_button, devices) = build_device_menu(&emit, &updating);
+    let (device_button, devices) = build_device_menu(&emit_ui, &updating);
     let ctx = AppsCtx {
         emit: emit_ui,
         apps: Rc::default(),

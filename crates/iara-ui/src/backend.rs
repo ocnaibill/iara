@@ -151,6 +151,8 @@ fn commands(name: &str, rx: mpsc::Receiver<UiCommand>, on_update: &OnUpdate) {
                 UiCommand::Deactivate => c.deactivate().map(|()| 0),
                 UiCommand::Profile(op) => c.profile_op(op).map(|_| 0),
                 UiCommand::Meters(on) => c.set_meters(*on).map(|()| 0),
+                UiCommand::SetOutputVolume(vol) => c.set_output_volume(*vol).map(|()| 0),
+                UiCommand::SetOutputMute(m) => c.set_output_mute(*m).map(|()| 0),
             };
             match result {
                 Ok(_) => {}

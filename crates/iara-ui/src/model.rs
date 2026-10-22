@@ -2,18 +2,18 @@
 //! Sem GTK e sem D-Bus: tudo aqui é função pura sobre `iara_ipc::State`.
 
 use iara_core::edit::EditCommand;
-use iara_core::{chatmix, Gain, Profile, SendControl};
+use iara_core::{chatmix, taper, Gain, Profile, SendControl};
 use iara_ipc::{AppEntry, AppSource, AppState, DefaultOutput, ProfileOp, SessionChoice, State};
 
 /// Menor posição positiva do slider: p = 0 é silêncio exato; qualquer p > 0 é um ganho de −60 a 0 dB (spec 5).
 pub const MIN_POSITION: f64 = 1e-6;
 
-/// Posição normalizada do slider (0..=1) → ganho. 0 = silêncio; 0 < p ≤ 1: dB = −60 + 60·p.
+/// Posição normalizada do slider (0..=1) → ganho. 0 = silêncio; 0 < p ≤ 1: curva `iara_core::taper` (dB = −60·(1−p)²).
 pub fn position_to_gain(position: f64) -> Gain {
     if !position.is_finite() || position <= 0.0 {
         return Gain::SILENCE;
     }
-    Gain::from_db(-60.0 + 60.0 * position.min(1.0)).unwrap_or(Gain::SILENCE)
+    Gain::from_db(taper::position_to_db(position)).unwrap_or(Gain::SILENCE)
 }
 
 /// Ganho → posição do slider. Silêncio vai a 0; −60 dB exato vai à menor posição positiva (só o campo numérico o
@@ -21,8 +21,21 @@ pub fn position_to_gain(position: f64) -> Gain {
 pub fn gain_to_position(gain: Gain) -> f64 {
     match gain.db() {
         None => 0.0,
-        Some(db) => ((db + 60.0) / 60.0).clamp(MIN_POSITION, 1.0),
+        Some(db) => taper::db_to_position(db).clamp(MIN_POSITION, 1.0),
     }
+}
+
+/// Passo de teclado em dB a partir de uma posição (a curva não é linear, então os passos são contados em dB, não em
+/// posição): subir do silêncio vai ao piso −60 dB; descer do piso vai ao silêncio; o resto satura em −60..=0.
+pub fn step_position(position: f64, delta_db: f64) -> f64 {
+    let floor = taper::FLOOR_DB;
+    let target = match position_to_gain(position).db() {
+        None if delta_db > 0.0 => floor,
+        None => return 0.0,
+        Some(db) if delta_db < 0.0 && db <= floor + 1e-3 => return 0.0,
+        Some(db) => (db + delta_db).clamp(floor, 0.0),
+    };
+    gain_to_position(Gain::from_db(target).unwrap_or(Gain::UNITY))
 }
 
 /// "−6,0 dB" com o sinal de menos tipográfico; silêncio como "−∞ dB". Exibe dB, nunca percentagem (spec 5).
@@ -206,7 +219,11 @@ pub fn coalesce_ui(commands: Vec<UiCommand>) -> Vec<UiCommand> {
         UiCommand::Edit(e) => coalesce_key(e),
         // ligar e desligar em rajada: vale o último pedido
         UiCommand::Meters(_) => Some("meters".to_owned()),
-        UiCommand::Session { .. } | UiCommand::Deactivate | UiCommand::Profile(_) => None,
+        UiCommand::SetOutputVolume(_) => Some("out_vol".to_owned()),
+        UiCommand::SetOutputMute(_)
+        | UiCommand::Session { .. }
+        | UiCommand::Deactivate
+        | UiCommand::Profile(_) => None,
     })
 }
 
@@ -301,6 +318,10 @@ pub enum UiCommand {
     },
     /// Liga ou desliga os medidores ao vivo (a janela pede enquanto está visível).
     Meters(bool),
+    /// Define o volume da saída física (0.0..=1.0).
+    SetOutputVolume(f64),
+    /// Define o mute da saída física.
+    SetOutputMute(bool),
 }
 
 /// Mover um aplicativo para `channel` (`None` = Não atribuídos). Salva uma regra no perfil, ou, com `session_only`,
@@ -536,6 +557,8 @@ mod tests {
             default_output: DefaultOutput::Active,
             profiles: vec![],
             devices: vec![],
+            output_volume: Some(1.0),
+            output_muted: false,
         }
     }
 
@@ -550,7 +573,8 @@ mod tests {
             Some(0.0),
             "acima do fim satura em 0 dB"
         );
-        assert!((position_to_gain(0.5).db().unwrap() - (-30.0)).abs() < 1e-9);
+        assert!((position_to_gain(0.5).db().unwrap() - (-15.0)).abs() < 1e-9);
+        assert!((position_to_gain(0.75).db().unwrap() - (-3.75)).abs() < 1e-9);
         for p in [0.001, 0.1, 0.25, 0.9, 1.0] {
             assert!(
                 (gain_to_position(position_to_gain(p)) - p).abs() < 1e-9,
@@ -562,6 +586,19 @@ mod tests {
         let minus_60 = Gain::from_db(-60.0).unwrap();
         assert!(gain_to_position(minus_60) > 0.0);
         assert!(position_to_gain(gain_to_position(minus_60)).db().is_some());
+    }
+
+    #[test]
+    fn keyboard_steps_count_in_db() {
+        let db = |p: f64| position_to_gain(p).db();
+        let at = |d: f64| gain_to_position(Gain::from_db(d).unwrap());
+        assert!((db(step_position(at(-10.0), 1.0)).unwrap() + 9.0).abs() < 1e-6);
+        assert!((db(step_position(at(-10.0), -6.0)).unwrap() + 16.0).abs() < 1e-6);
+        assert_eq!(db(step_position(at(-0.5), 1.0)), Some(0.0), "satura em 0 dB");
+        assert!((db(step_position(0.0, 1.0)).unwrap() + 60.0).abs() < 1e-3, "do silêncio ao piso");
+        assert_eq!(step_position(at(-60.0), -1.0), 0.0, "do piso ao silêncio");
+        assert_eq!(step_position(0.0, -1.0), 0.0);
+        assert!((db(step_position(at(-59.5), -1.0)).unwrap() + 60.0).abs() < 1e-3);
     }
 
     #[test]
@@ -637,7 +674,7 @@ mod tests {
         let mic = cols.last().unwrap().mic.as_ref().unwrap();
         assert!(mic.global_mute && mic.applications.enabled);
         assert_eq!(mic.input_label, "−20,0 dB");
-        assert!((mic.input_position - 2.0 / 3.0).abs() < 1e-9);
+        assert!((mic.input_position - (1.0 - (1.0_f64 / 3.0).sqrt())).abs() < 1e-9);
         assert!(cols[..cols.len() - 1].iter().all(|c| c.mic.is_none()));
         // o MIC inicial: escuta desabilitada (monitoramento desligado), transmissão ligada
         assert!(
