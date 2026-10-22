@@ -313,8 +313,6 @@ struct State {
     taps: crate::meters::Taps,
     /// Volume atual e mute do dispositivo de saída (volume, mute).
     output_volume: Option<(f64, bool)>,
-    /// Último volume observado em iara.unassigned (para sincronização sem laço).
-    last_unassigned_vol: Option<(f64, bool)>,
     /// Contador de ticks para o sincronizador de volume (evita chamadas excessivas).
     volume_tick: u32,
 }
@@ -486,7 +484,7 @@ pub fn write_node_volume(id: u32, volume: f64, muted: bool) {
         .status();
 }
 
-/// Sincroniza o volume do dispositivo físico de saída e de `iara.unassigned` (teclas de volume e slider do sistema).
+/// Sincroniza o volume do dispositivo físico de saída (leitura periódica e envio à UI).
 fn reconcile_device_volume(st: &mut State, ev: &EventSink) {
     let output_link = st
         .devices
@@ -503,45 +501,19 @@ fn reconcile_device_volume(st: &mut State, ev: &EventSink) {
         .iter()
         .find(|(_, n)| **n == phys_name)
         .map(|(id, _)| *id);
-    let unassigned_id = st
-        .nodes_present
-        .iter()
-        .find(|(_, n)| **n == iara_core::topology::UNASSIGNED)
-        .map(|(id, _)| *id);
 
     let Some(pid) = phys_id else {
         return;
     };
 
-    // Leitura inicial
-    if st.output_volume.is_none() {
-        if let Some((vol, muted)) = read_node_volume(pid) {
+    if let Some((vol, muted)) = read_node_volume(pid) {
+        let changed = match st.output_volume {
+            None => true,
+            Some((v, m)) => (v - vol).abs() > 0.008 || m != muted,
+        };
+        if changed {
             st.output_volume = Some((vol, muted));
-            st.last_unassigned_vol = Some((vol, muted));
-            if let Some(uid) = unassigned_id {
-                write_node_volume(uid, vol, muted);
-            }
             ev(Event::OutputVolume { volume: vol, muted });
-        }
-        return;
-    }
-
-    // Teclas / slider do sistema alteraram iara.unassigned
-    if let Some(uid) = unassigned_id {
-        if let Some((u_vol, u_muted)) = read_node_volume(uid) {
-            let changed = match st.last_unassigned_vol {
-                None => true,
-                Some((last_v, last_m)) => (last_v - u_vol).abs() > 0.008 || last_m != u_muted,
-            };
-            if changed {
-                st.last_unassigned_vol = Some((u_vol, u_muted));
-                st.output_volume = Some((u_vol, u_muted));
-                write_node_volume(pid, u_vol, u_muted);
-                ev(Event::OutputVolume {
-                    volume: u_vol,
-                    muted: u_muted,
-                });
-            }
         }
     }
 }
@@ -1039,7 +1011,7 @@ fn run(
             {
                 let mut s = st.borrow_mut();
                 s.volume_tick = s.volume_tick.wrapping_add(1);
-                if s.volume_tick.is_multiple_of(2) {
+                if s.volume_tick.is_multiple_of(10) {
                     reconcile_device_volume(&mut s, &ev);
                 }
                 reconcile_devices(&mut s, &ctx, &ev);
@@ -1094,7 +1066,6 @@ fn run(
             Command::SetOutputVolume(vol, muted) => {
                 let mut s = st.borrow_mut();
                 s.output_volume = Some((vol, muted));
-                s.last_unassigned_vol = Some((vol, muted));
                 if let Some(d) = s
                     .devices
                     .iter()
@@ -1110,14 +1081,6 @@ fn run(
                             write_node_volume(pid, vol, muted);
                         }
                     }
-                }
-                if let Some(uid) = s
-                    .nodes_present
-                    .iter()
-                    .find(|(_, n)| **n == iara_core::topology::UNASSIGNED)
-                    .map(|(id, _)| *id)
-                {
-                    write_node_volume(uid, vol, muted);
                 }
                 ev(Event::OutputVolume { volume: vol, muted });
             }
