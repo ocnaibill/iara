@@ -1,0 +1,37 @@
+# Maintainer: ocnaibill <biancocosta01@gmail.com>
+pkgname=iara
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Advanced submixing and audio routing for Linux with PipeWire"
+arch=('x86_64')
+url="https://github.com/ocnaibill/iara"
+license=('MIT')
+depends=('pipewire' 'wireplumber' 'gtk4' 'glib2')
+makedepends=('cargo' 'clang' 'pkgconf')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --all-targets
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --workspace --all-features
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  make DESTDIR="$pkgdir" PREFIX=/usr SYSTEMD_USER_DIR=/usr/lib/systemd/user install
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

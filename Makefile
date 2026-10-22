@@ -5,8 +5,9 @@ SYSTEMD_USER_DIR ?= $(PREFIX)/lib/systemd/user
 
 CARGO ?= cargo
 TARGET = release
+VERSION ?= 0.1.0
 
-.PHONY: all build check test clean install uninstall
+.PHONY: all build check test clean install install-bin uninstall dist deb packages
 
 all: build
 
@@ -21,8 +22,11 @@ test:
 
 clean:
 	$(CARGO) clean
+	rm -rf dist
 
-install: build
+install: build install-bin
+
+install-bin:
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -m 755 target/release/iara-service "$(DESTDIR)$(BINDIR)/iara-service"
 	install -m 755 target/release/iara-ui "$(DESTDIR)$(BINDIR)/iara-ui"
@@ -42,3 +46,11 @@ uninstall:
 	rm -f "$(DESTDIR)$(DATADIR)/metainfo/dev.iara.Mixer.metainfo.xml"
 	rm -f "$(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/dev.iara.Mixer.svg"
 	rm -f "$(DESTDIR)$(SYSTEMD_USER_DIR)/iara.service"
+
+dist: build
+	./packaging/make-dist.sh $(VERSION)
+
+deb: build
+	./packaging/make-deb.sh $(VERSION)
+
+packages: dist deb

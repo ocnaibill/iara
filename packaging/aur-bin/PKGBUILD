@@ -1,0 +1,19 @@
+# Maintainer: ocnaibill <biancocosta01@gmail.com>
+pkgname=iara-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Advanced submixing and audio routing for Linux with PipeWire (precompiled release binary)"
+arch=('x86_64')
+url="https://github.com/ocnaibill/iara"
+license=('MIT')
+depends=('pipewire' 'wireplumber' 'gtk4' 'glib2')
+provides=('iara')
+conflicts=('iara')
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/iara-v$pkgver-x86_64-linux.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "iara-v$pkgver-x86_64-linux"
+  make DESTDIR="$pkgdir" PREFIX=/usr SYSTEMD_USER_DIR=/usr/lib/systemd/user install-bin
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
