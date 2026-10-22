@@ -1,0 +1,18 @@
+pkgbase = iara
+	pkgdesc = Advanced submixing and audio routing for Linux with PipeWire
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/ocnaibill/iara
+	arch = x86_64
+	license = MIT
+	makedepends = cargo
+	makedepends = clang
+	makedepends = pkgconf
+	depends = pipewire
+	depends = wireplumber
+	depends = gtk4
+	depends = glib2
+	source = iara-0.1.0.tar.gz::https://github.com/ocnaibill/iara/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = iara

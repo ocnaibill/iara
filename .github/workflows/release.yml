@@ -17,7 +17,7 @@ permissions:
 jobs:
   build-release:
     name: Build & Publish Release Packages
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
