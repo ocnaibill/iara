@@ -1,0 +1,16 @@
+[Unit]
+Description=Iara Audio Engine & Routing Service
+Documentation=https://github.com/ocnaibill/iara
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/iara-service
+Restart=on-failure
+RestartSec=2s
+Slice=session.slice
+
+[Install]
+WantedBy=default.target

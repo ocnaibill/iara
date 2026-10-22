@@ -1,0 +1,25 @@
+[Desktop Entry]
+Name=Iara
+GenericName=Audio Mixer
+GenericName[pt_BR]=Mixer de Áudio
+Comment=Advanced submixing and audio routing for Linux with PipeWire
+Comment[pt_BR]=Submixagem avançada e roteamento de áudio para Linux com PipeWire
+Exec=iara-ui
+Icon=dev.iara.Mixer
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Mixer;GTK;
+Keywords=audio;sound;mixer;pipewire;volume;routing;stream;goxlr;wavelink;
+StartupNotify=true
+StartupWMClass=dev.iara.Mixer
+Actions=ServiceStart;ServiceStop;
+
+[Desktop Action ServiceStart]
+Name=Start Background Service
+Name[pt_BR]=Iniciar Serviço em Segundo Plano
+Exec=iara-service
+
+[Desktop Action ServiceStop]
+Name=Stop Background Service
+Name[pt_BR]=Encerrar Serviço
+Exec=systemctl --user stop iara.service

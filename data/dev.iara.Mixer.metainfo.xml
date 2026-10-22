@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.iara.Mixer</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Iara</name>
+  <summary>Advanced submixing and audio routing for Linux</summary>
+  <summary xml:lang="pt_BR">Submixagem avançada e roteamento de áudio para Linux</summary>
+  <description>
+    <p>
+      Iara is a modern, responsive audio mixer and router for Linux powered by PipeWire.
+      Inspired by hardware mixers like GoXLR and Elgato Wave Link, Iara allows you to split
+      your applications across dedicated virtual audio channels (Media, Games, Chat, Aux, Browser),
+      route streams seamlessly without audio dropouts, and create distinct mixes for your headphones
+      and your stream audience.
+    </p>
+    <p xml:lang="pt_BR">
+      O Iara é um mixer e roteador de áudio moderno e responsivo para Linux sobre PipeWire.
+      Inspirado em soluções de hardware como GoXLR e Elgato Wave Link, o Iara divide seus
+      aplicativos em canais virtuais dedicados (Mídia, Jogos, Voz, Aux, Navegador), roteia fluxos
+      instantaneamente sem interrupção de som e permite criar mixagens distintas para fone e transmissão.
+    </p>
+  </description>
+  <launchable type="desktop-id">dev.iara.Mixer.desktop</launchable>
+  <provides>
+    <binary>iara-ui</binary>
+    <binary>iara-service</binary>
+    <dbus type="session">dev.iara.Mixer</dbus>
+  </provides>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Mixer</category>
+  </categories>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-10-22">
+      <description>
+        <p>First stable release featuring PipeWire native submixing, hardware volume synchronization, natural quadratic fader curve, persistent device tracking, and responsive GTK4 interface.</p>
+      </description>
+    </release>
+  </releases>
+</component>
