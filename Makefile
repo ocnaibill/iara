@@ -12,7 +12,7 @@ VERSION ?= 0.1.0
 all: build
 
 build:
-	$(CARGO) build --release
+	$(CARGO) build --workspace --release --all-features
 
 check:
 	$(CARGO) check --workspace --all-targets

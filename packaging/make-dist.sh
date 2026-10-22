@@ -16,7 +16,7 @@ echo "=== Construindo pacote de distribuição: ${PKG_NAME}.tar.gz ==="
 # Garante binários compilados
 if [ ! -f "$ROOT_DIR/target/release/iara-service" ] || [ ! -f "$ROOT_DIR/target/release/iara-ui" ]; then
   echo "Compilando binários em modo release..."
-  cargo build --release
+  cargo build --workspace --release --all-features
 fi
 
 rm -rf "$STAGE_DIR"

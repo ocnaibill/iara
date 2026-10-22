@@ -16,7 +16,7 @@ echo "=== Construindo pacote Debian: ${PKG_NAME}.deb ==="
 # Garante que os binários existem
 if [ ! -f "$ROOT_DIR/target/release/iara-service" ] || [ ! -f "$ROOT_DIR/target/release/iara-ui" ]; then
   echo "Compilando binários em modo release..."
-  cargo build --release
+  cargo build --workspace --release --all-features
 fi
 
 rm -rf "$BUILD_DIR"
