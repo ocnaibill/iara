@@ -14,7 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
 use std::io::Cursor;
 use std::rc::Rc;
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -312,7 +313,7 @@ struct State {
     /// Taps de medição ativos (vazio quando nenhuma interface pede medidores).
     taps: crate::meters::Taps,
     /// Volume atual e mute do dispositivo de saída (volume, mute).
-    output_volume: Option<(f64, bool)>,
+    output_volume: Arc<Mutex<Option<(f64, bool)>>>,
     /// Contador de ticks para o sincronizador de volume (evita chamadas excessivas).
     volume_tick: u32,
 }
@@ -472,28 +473,37 @@ pub fn read_node_volume(id: u32) -> Option<(f64, bool)> {
     Some((vol, muted))
 }
 
-/// Aplica o volume e o mute de um nó via wpctl.
+/// Aplica o volume e o mute de um nó via wpctl de forma assíncrona (não bloqueia o laço PipeWire).
 pub fn write_node_volume(id: u32, volume: f64, muted: bool) {
     let vol_str = format!("{:.3}", volume.clamp(0.0, 1.5));
-    let _ = std::process::Command::new("wpctl")
-        .args(["set-volume", &id.to_string(), &vol_str])
-        .status();
     let mute_str = if muted { "1" } else { "0" };
-    let _ = std::process::Command::new("wpctl")
-        .args(["set-mute", &id.to_string(), mute_str])
-        .status();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("wpctl")
+            .args(["set-volume", &id.to_string(), &vol_str])
+            .status();
+        let _ = std::process::Command::new("wpctl")
+            .args(["set-mute", &id.to_string(), mute_str])
+            .status();
+    });
 }
 
-/// Sincroniza o volume do dispositivo físico de saída (leitura periódica e envio à UI).
+/// Sincroniza o volume do dispositivo físico de saída (leitura assíncrona periódica e envio à UI).
 fn reconcile_device_volume(st: &mut State, ev: &EventSink) {
+    static IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+    if IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
     let output_link = st
         .devices
         .iter()
         .find(|d| d.direction == DeviceDirection::Output);
     let Some(d) = output_link else {
+        IN_PROGRESS.store(false, Ordering::SeqCst);
         return;
     };
     let Some(phys_name) = resolve_link_physical(st, d) else {
+        IN_PROGRESS.store(false, Ordering::SeqCst);
         return;
     };
     let phys_id = st
@@ -503,19 +513,27 @@ fn reconcile_device_volume(st: &mut State, ev: &EventSink) {
         .map(|(id, _)| *id);
 
     let Some(pid) = phys_id else {
+        IN_PROGRESS.store(false, Ordering::SeqCst);
         return;
     };
 
-    if let Some((vol, muted)) = read_node_volume(pid) {
-        let changed = match st.output_volume {
-            None => true,
-            Some((v, m)) => (v - vol).abs() > 0.008 || m != muted,
-        };
-        if changed {
-            st.output_volume = Some((vol, muted));
-            ev(Event::OutputVolume { volume: vol, muted });
+    let ev = ev.clone();
+    let vol_ref = st.output_volume.clone();
+    std::thread::spawn(move || {
+        if let Some((vol, muted)) = read_node_volume(pid) {
+            let mut guard = vol_ref.lock().unwrap();
+            let changed = match *guard {
+                None => true,
+                Some((v, m)) => (v - vol).abs() > 0.008 || m != muted,
+            };
+            if changed {
+                *guard = Some((vol, muted));
+                drop(guard);
+                ev(Event::OutputVolume { volume: vol, muted });
+            }
         }
-    }
+        IN_PROGRESS.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Cria/remove as ligações com dispositivos físicos conforme a presença no registro.
@@ -1011,7 +1029,7 @@ fn run(
             {
                 let mut s = st.borrow_mut();
                 s.volume_tick = s.volume_tick.wrapping_add(1);
-                if s.volume_tick.is_multiple_of(10) {
+                if s.volume_tick.is_multiple_of(10) || s.output_volume.lock().unwrap().is_none() {
                     reconcile_device_volume(&mut s, &ev);
                 }
                 reconcile_devices(&mut s, &ctx, &ev);
@@ -1064,8 +1082,8 @@ fn run(
                 reconcile_routes(&mut s, &ev);
             }
             Command::SetOutputVolume(vol, muted) => {
-                let mut s = st.borrow_mut();
-                s.output_volume = Some((vol, muted));
+                let s = st.borrow_mut();
+                *s.output_volume.lock().unwrap() = Some((vol, muted));
                 if let Some(d) = s
                     .devices
                     .iter()
